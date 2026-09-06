@@ -1,0 +1,221 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>Runbook (Manager Overview) — Azure Resource Diff Tool</title>
+<style>
+  body { font-family: -apple-system, Segoe UI, Arial, sans-serif; max-width: 900px; margin: 40px auto; padding: 0 20px; line-height: 1.65; color: #1f2328; }
+  h1 { color: #0969da; border-bottom: 2px solid #0969da; padding-bottom: 10px; }
+  h2 { color: #0969da; border-bottom: 1px solid #d0d7de; padding-bottom: 6px; margin-top: 32px; }
+  h3 { color: #24292f; }
+  code { background: #f6f8fa; padding: 2px 6px; border-radius: 4px; font-family: Consolas, monospace; font-size: 0.9em; }
+  pre { background: #f6f8fa; padding: 14px; border-radius: 8px; overflow-x: auto; border: 1px solid #d0d7de; }
+  pre code { background: none; padding: 0; }
+  table { border-collapse: collapse; width: 100%; margin: 16px 0; }
+  th, td { border: 1px solid #d0d7de; padding: 8px 12px; text-align: left; }
+  th { background: #f0f6ff; color: #0969da; }
+  strong { color: #24292f; }
+  a { color: #0969da; }
+</style>
+</head>
+<body>
+<h1 id="runbook-manager-overview-azure-resource-diff-diagram-tool">Runbook (Manager Overview) — Azure Resource Diff &amp; Diagram Tool</h1>
+<p><strong>Purpose of this document:</strong> explain how the tool works and how to verify it's working correctly — using only the environment's <strong>existing</strong> resources. This document contains <strong>no commands that create or delete any Azure resource</strong>. For full technical setup/deployment instructions, see the separate Technical/Test Runbook.</p>
+<hr />
+<h2 id="1-tools-and-applications-used-by-this-project">1. Tools and applications used by this project</h2>
+<table>
+<thead>
+<tr>
+<th>Tool</th>
+<th>Purpose</th>
+<th>Download</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><strong>Azure subscription</strong></td>
+<td>Where the environment being monitored, and the tool itself, both run</td>
+<td>(existing organizational access)</td>
+</tr>
+<tr>
+<td><strong>Azure CLI</strong></td>
+<td>Command-line tool used to set up and check on Azure resources</td>
+<td>https://learn.microsoft.com/en-us/cli/azure/install-azure-cli</td>
+</tr>
+<tr>
+<td><strong>Azure Functions Core Tools</strong></td>
+<td>Used to deploy the tool's code to Azure</td>
+<td>https://go.microsoft.com/fwlink/?linkid=2174087</td>
+</tr>
+<tr>
+<td><strong>Python 3.11</strong></td>
+<td>The programming language the tool's logic is written in</td>
+<td>https://www.python.org/downloads/</td>
+</tr>
+<tr>
+<td><strong>Visual Studio Code</strong> (optional, for viewing/editing code)</td>
+<td>Code editor</td>
+<td>https://code.visualstudio.com/download</td>
+</tr>
+<tr>
+<td><strong>Git for Windows</strong> (includes Git Bash)</td>
+<td>Provides a command-line terminal compatible with the setup steps</td>
+<td>https://git-scm.com/download/win</td>
+</tr>
+<tr>
+<td><strong>Microsoft Azure Architecture Icons</strong></td>
+<td>Official icon artwork used in the generated diagrams</td>
+<td>https://learn.microsoft.com/en-us/azure/architecture/icons/</td>
+</tr>
+</tbody>
+</table>
+<p><strong>Note:</strong> all of the above are free, officially provided by Microsoft (or open-source, in Git/VS Code's case) — no paid licenses or third-party tools are involved. None of these need to be installed by everyday users of the tool's output; they're only needed by whoever sets up or maintains the tool itself.</p>
+<h2 id="2-what-this-tool-does">2. What this tool does</h2>
+<p>Every day at a scheduled time (currently <strong>midnight Singapore Time</strong>), the tool automatically:
+1. Reads the full list of resources in our Azure environment
+2. Compares it to yesterday's list
+3. Identifies what was <strong>added</strong>, <strong>removed</strong>, or <strong>modified</strong>
+4. Draws a visual diagram showing how resources relate to each other (e.g. a virtual machine connected to its network card, disk, and virtual network) — using the same official Microsoft icons seen in the Azure Portal
+5. Saves the diagram and a change report into our own storage account</p>
+<hr />
+<h2 id="3-how-it-works-flow">3. How it works (flow)</h2>
+<pre><code> Every day at 12:00 AM Singapore Time
+          │
+          ▼
+ ┌─────────────────────────┐
+ │ 1. Query Azure for every  │   READ-ONLY — cannot modify anything
+ │    resource's details      │
+ └───────────┬─────────────┘
+             │
+             ▼
+ ┌─────────────────────────┐
+ │ 2. Save today's inventory │   WRITE — only to our own storage account
+ └───────────┬─────────────┘
+             │
+             ▼
+ ┌─────────────────────────┐
+ │ 3. Compare to yesterday's │   No Azure calls — pure calculation
+ │    inventory               │
+ └───────────┬─────────────┘
+             │
+             ▼
+ ┌─────────────────────────┐
+ │ 4. Draw a diagram + table  │   No Azure calls — pure calculation
+ │    of what changed          │
+ └───────────┬─────────────┘
+             │
+             ▼
+ ┌─────────────────────────┐
+ │ 5. Save the diagram +      │   WRITE — only to our own storage account
+ │    report                  │
+ └─────────────────────────┘
+</code></pre>
+<hr />
+<h2 id="4-the-safety-boundary-where-it-reads-vs-writes">4. The safety boundary — where it reads vs. writes</h2>
+<table>
+<thead>
+<tr>
+<th>Action</th>
+<th>Read or Write?</th>
+<th>Scope</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Querying resource details</td>
+<td><strong>Read only</strong></td>
+<td>Can see resource names, types, configurations — <strong>cannot</strong> create, modify, or delete anything</td>
+</tr>
+<tr>
+<td>Saving snapshot/diff/diagram files</td>
+<td><strong>Write</strong></td>
+<td>Limited to specific folders inside <strong>one storage account we designated</strong> — nothing else</td>
+</tr>
+</tbody>
+</table>
+<p>The tool's only two permissions are:
+- <strong>Reader</strong> on the subscription (view-only)
+- <strong>Storage write access</strong>, scoped to just the one storage account it saves reports to</p>
+<p><strong>Who these permissions belong to:</strong> the Function App itself — the automated compute component that runs the tool's code — not any individual person's account. Azure manages this identity automatically; no one logs in as it, and no password exists for it. This is what lets the tool run unattended, on its own schedule, without any person's credentials being involved.</p>
+<p>It has no technical ability to change production resources, even if there were a bug in the code.</p>
+<hr />
+<h2 id="5-what-the-output-looks-like">5. What the output looks like</h2>
+<p><strong>The diagram</strong> shows every resource as an icon (matching the Azure Portal's own icon style), connected by arrows showing real relationships — for example: a Virtual Machine connects to its Network Interface and Disk; the Network Interface connects to its Virtual Network, Public IP, and Network Security Group; a Function App connects to its App Service Plan and Application Insights.</p>
+<p>Resources are color-coded by change status:
+- <strong>Green border</strong> = added since yesterday
+- <strong>Red border</strong> = removed since yesterday
+- <strong>Amber border</strong> = modified since yesterday
+- <strong>Plain border</strong> = unchanged</p>
+<p><strong>Below the diagram</strong>, a three-column table specifically for network-related resources:
+- <strong>Current Network Resources</strong> — everything that exists today
+- <strong>Newly Added</strong> — anything new since yesterday
+- <strong>Newly Deleted</strong> — anything removed since yesterday</p>
+<h3 id="where-this-output-is-stored-three-separate-folders-each-with-a-distinct-purpose">Where this output is stored — three separate folders, each with a distinct purpose</h3>
+<table>
+<thead>
+<tr>
+<th>Folder (container)</th>
+<th>Contains</th>
+<th>Why it's kept separate</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><strong>snapshots</strong></td>
+<td>The full raw list of every resource, saved once per day</td>
+<td>The underlying data everything else is calculated from — kept apart so it can be retained long-term for audit purposes without cluttering the visual outputs</td>
+</tr>
+<tr>
+<td><strong>diffs</strong></td>
+<td>A plain-text/JSON report of what changed</td>
+<td>The "what changed" answer on its own — quick to read without opening the diagram</td>
+</tr>
+<tr>
+<td><strong>diagrams</strong></td>
+<td>The visual diagram people actually look at</td>
+<td>Kept separate so only the most recent 1-2 are retained (older ones are automatically cleaned up), independent of how long the raw data/reports are kept</td>
+</tr>
+</tbody>
+</table>
+<p>Keeping these apart also means different retention rules can apply to each — for example, diagrams are automatically limited to the 2 most recent, while the underlying data can be kept indefinitely for historical reference.</p>
+<hr />
+<h2 id="6-how-to-verify-its-working-using-only-existing-resources">6. How to verify it's working — using only existing resources</h2>
+<p>These steps <strong>observe already-generated output</strong> or <strong>trigger the existing, already-deployed automation to run early</strong> — nothing here creates, modifies, or deletes any Azure resource.</p>
+<h3 id="check-that-todays-report-was-generated">Check that today's report was generated</h3>
+<p>In the Azure Portal:
+1. Navigate to the storage account being used for reports
+2. Open the <strong>diagrams</strong> container
+3. Confirm there's a file dated today, with a recent "Last modified" time</p>
+<h3 id="view-the-diagram">View the diagram</h3>
+<ol>
+<li>Click the file, then <strong>Download</strong> (or open the <strong>View/Edit</strong> option if available)</li>
+<li>Open the downloaded file in a web browser — it renders as an image directly</li>
+</ol>
+<h3 id="view-the-change-report-plain-text-summary">View the change report (plain-text summary)</h3>
+<ol>
+<li>In the same storage account, open the <strong>diffs</strong> container</li>
+<li>Download and open the <code>.md</code> file for today's date — it lists what was added/removed in plain, readable text</li>
+</ol>
+<h3 id="trigger-the-automation-to-run-right-now-instead-of-waiting-for-the-schedule">Trigger the automation to run right now, instead of waiting for the schedule</h3>
+<p><em>(This runs the existing, already-deployed function — it does not create anything new.)</em>
+1. In the Azure Portal, navigate to the existing Function App
+2. Under <strong>Functions</strong>, click the deployed function
+3. Click <strong>Test/Run</strong> (if available in this Portal view) → <strong>Run</strong>
+4. Wait about 20-30 seconds, then re-check the <strong>diagrams</strong>/<strong>diffs</strong> containers for a newer timestamp</p>
+<h3 id="confirm-the-schedule-is-set-correctly">Confirm the schedule is set correctly</h3>
+<ol>
+<li>In the Function App's function, check its trigger configuration</li>
+<li>Confirm it shows the expected daily schedule time</li>
+</ol>
+<hr />
+<h2 id="7-what-to-look-for-as-evidence-the-tool-is-working-correctly">7. What to look for as evidence the tool is working correctly</h2>
+<ul>
+<li>A new file appears in <strong>diagrams</strong> and <strong>diffs</strong> every day, automatically, without anyone manually running anything</li>
+<li>The diagram visually matches the current state of the environment (resources you know exist show up; resources you know were removed show up as "Removed" the day after)</li>
+<li>The 3-column table's "Current Network Resources" count matches expectations for the environment's actual network footprint</li>
+</ul>
+<hr />
+<h2 id="8-who-to-contact-for-changes">8. Who to contact for changes</h2>
+<p>Any change to <strong>what</strong> the tool tracks, <strong>how often</strong> it runs, or <strong>where</strong> it saves output requires editing the tool's code and redeploying — this is a controlled, documented process (see the Technical/Test Runbook) performed by whoever manages this tool, not something adjustable from the Portal alone.</p>
+</body>
+</html>

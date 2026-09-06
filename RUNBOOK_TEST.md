@@ -98,7 +98,25 @@ echo $PRINCIPAL_ID
 ```
 **Purpose:** creates an Azure-managed "robot identity" tied to this Function App, so the deployed code can authenticate without any stored password/key. `echo` confirms it worked — must print a GUID.
 
+**If `echo $PRINCIPAL_ID` prints nothing (empty):** the identity assignment likely hasn't taken effect yet. Re-run just the fetch (no need to re-run `identity assign`):
+```bash
+PRINCIPAL_ID=$(az functionapp identity show --name functionapp1-mtdiff4728 --resource-group rg-terraform-state --query principalId -o tsv)
+echo $PRINCIPAL_ID
+```
+If it's still empty after that, wait 10-15 seconds (identity assignment can take a moment to propagate) and try the fetch again.
+
 ### 5. Grant minimum permissions
+
+**Who is receiving these permissions:** the Function App **`functionapp1-mtdiff4728`** itself — specifically, the managed identity created for it in Step 4 (`$PRINCIPAL_ID`). This is not your personal Azure login, not a human user, and not any other resource — it's the "robot account" belonging solely to this one Function App.
+
+**Why it needs permissions at all:** once the code is deployed and running, **the Function App itself** makes the actual API calls (querying Resource Graph, writing to blob storage) on its own schedule — not you, sitting at your laptop. So the permissions must belong to the app, letting it operate independently without anyone being logged in.
+
+**Why two separate grants, each scoped narrowly:**
+| Grant | Scope | Why the Function App needs it |
+|---|---|---|
+| **Reader** | The whole subscription | So it can query resource metadata via Resource Graph — read-only, cannot change anything |
+| **Storage Blob Data Contributor** | Only the one storage account (`sttfstatemigration`) | So it can upload its own snapshots/diffs/diagrams — nothing broader than that one account |
+
 ```bash
 MSYS_NO_PATHCONV=1 az role assignment create \
   --assignee-object-id "$PRINCIPAL_ID" \

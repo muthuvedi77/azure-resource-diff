@@ -77,6 +77,8 @@ The tool's only two permissions are:
 - **Reader** on the subscription (view-only)
 - **Storage write access**, scoped to just the one storage account it saves reports to
 
+**Who these permissions belong to:** the Function App itself — the automated compute component that runs the tool's code — not any individual person's account. Azure manages this identity automatically; no one logs in as it, and no password exists for it. This is what lets the tool run unattended, on its own schedule, without any person's credentials being involved.
+
 It has no technical ability to change production resources, even if there were a bug in the code.
 
 ---

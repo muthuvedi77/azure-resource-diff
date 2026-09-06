@@ -4,18 +4,15 @@
 <meta charset="UTF-8">
 <title>Runbook (Technical/Test) — Azure Resource Diff Tool</title>
 <style>
-  body { font-family: -apple-system, Segoe UI, Arial, sans-serif; max-width: 900px; margin: 40px auto; padding: 0 20px; line-height: 1.65; color: #1f2328; }
-  h1 { color: #0969da; border-bottom: 2px solid #0969da; padding-bottom: 10px; }
-  h2 { color: #0969da; border-bottom: 1px solid #d0d7de; padding-bottom: 6px; margin-top: 32px; }
-  h3 { color: #24292f; }
+  body { font-family: -apple-system, Segoe UI, Arial, sans-serif; max-width: 900px; margin: 40px auto; padding: 0 20px; line-height: 1.6; color: #1f2328; }
+  h1, h2, h3 { color: #0969da; border-bottom: 1px solid #d0d7de; padding-bottom: 6px; }
   code { background: #f6f8fa; padding: 2px 6px; border-radius: 4px; font-family: Consolas, monospace; font-size: 0.9em; }
   pre { background: #f6f8fa; padding: 14px; border-radius: 8px; overflow-x: auto; border: 1px solid #d0d7de; }
   pre code { background: none; padding: 0; }
   table { border-collapse: collapse; width: 100%; margin: 16px 0; }
   th, td { border: 1px solid #d0d7de; padding: 8px 12px; text-align: left; }
-  th { background: #f0f6ff; color: #0969da; }
+  th { background: #f6f8fa; }
   strong { color: #24292f; }
-  a { color: #0969da; }
 </style>
 </head>
 <body>
@@ -156,7 +153,19 @@ PRINCIPAL_ID=$(az functionapp identity show --name functionapp1-mtdiff4728 --res
 echo $PRINCIPAL_ID
 </code></pre>
 <p><strong>Purpose:</strong> creates an Azure-managed "robot identity" tied to this Function App, so the deployed code can authenticate without any stored password/key. <code>echo</code> confirms it worked — must print a GUID.</p>
+<p><strong>If <code>echo $PRINCIPAL_ID</code> prints nothing (empty):</strong> the identity assignment likely hasn't taken effect yet. Re-run just the fetch (no need to re-run <code>identity assign</code>):</p>
+<pre><code class="language-bash">PRINCIPAL_ID=$(az functionapp identity show --name functionapp1-mtdiff4728 --resource-group rg-terraform-state --query principalId -o tsv)
+echo $PRINCIPAL_ID
+</code></pre>
+<p>If it's still empty after that, wait 10-15 seconds (identity assignment can take a moment to propagate) and try the fetch again.</p>
 <h3 id="5-grant-minimum-permissions">5. Grant minimum permissions</h3>
+<p><strong>Who is receiving these permissions:</strong> the Function App <strong><code>functionapp1-mtdiff4728</code></strong> itself — specifically, the managed identity created for it in Step 4 (<code>$PRINCIPAL_ID</code>). This is not your personal Azure login, not a human user, and not any other resource — it's the "robot account" belonging solely to this one Function App.</p>
+<p><strong>Why it needs permissions at all:</strong> once the code is deployed and running, <strong>the Function App itself</strong> makes the actual API calls (querying Resource Graph, writing to blob storage) on its own schedule — not you, sitting at your laptop. So the permissions must belong to the app, letting it operate independently without anyone being logged in.</p>
+<p><strong>Why two separate grants, each scoped narrowly:</strong>
+| Grant | Scope | Why the Function App needs it |
+|---|---|---|
+| <strong>Reader</strong> | The whole subscription | So it can query resource metadata via Resource Graph — read-only, cannot change anything |
+| <strong>Storage Blob Data Contributor</strong> | Only the one storage account (<code>sttfstatemigration</code>) | So it can upload its own snapshots/diffs/diagrams — nothing broader than that one account |</p>
 <pre><code class="language-bash">MSYS_NO_PATHCONV=1 az role assignment create \
   --assignee-object-id &quot;$PRINCIPAL_ID&quot; \
   --assignee-principal-type ServicePrincipal \
