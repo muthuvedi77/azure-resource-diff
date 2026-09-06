@@ -1,0 +1,232 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>Azure Resource Diff Tool — Manager Overview</title>
+<style>
+  body {
+    font-family: -apple-system, Segoe UI, Arial, sans-serif;
+    max-width: 900px;
+    margin: 40px auto;
+    padding: 0 20px;
+    line-height: 1.65;
+    color: #1f2328;
+  }
+  h1 { color: #0969da; border-bottom: 2px solid #0969da; padding-bottom: 10px; }
+  h2 { color: #0969da; border-bottom: 1px solid #d0d7de; padding-bottom: 6px; margin-top: 36px; }
+  h3 { color: #24292f; }
+  code {
+    background: #f6f8fa;
+    padding: 2px 6px;
+    border-radius: 4px;
+    font-family: Consolas, monospace;
+    font-size: 0.9em;
+  }
+  pre {
+    background: #f6f8fa;
+    padding: 16px;
+    border-radius: 8px;
+    overflow-x: auto;
+    border: 1px solid #d0d7de;
+    line-height: 1.4;
+  }
+  pre code { background: none; padding: 0; }
+  table { border-collapse: collapse; width: 100%; margin: 16px 0; }
+  th, td { border: 1px solid #d0d7de; padding: 10px 14px; text-align: left; }
+  th { background: #f0f6ff; color: #0969da; }
+  tr:nth-child(even) { background: #fafbfc; }
+  strong { color: #24292f; }
+</style>
+</head>
+<body>
+<h1 id="azure-resource-diff-diagram-tool-overview-for-management">Azure Resource Diff &amp; Diagram Tool — Overview for Management</h1>
+<h2 id="1-what-this-project-does">1. What this project does</h2>
+<p>Every day at a scheduled time (currently 6:00 PM Singapore Time), this tool automatically:
+1. Takes a full inventory of resources in our Azure environment
+2. Compares it to yesterday's inventory
+3. Identifies what was <strong>added</strong>, <strong>removed</strong>, or <strong>modified</strong>
+4. Draws a visual diagram showing how resources relate to each other (e.g. a virtual machine connected to its network card, disk, and virtual network)
+5. Saves the diagram and a change report into our own Azure storage account</p>
+<p><strong>In one sentence:</strong> it's an automated daily "what changed in our Azure environment, and what does it look like" report — with zero manual effort once set up.</p>
+<hr />
+<h2 id="2-why-we-built-this">2. Why we built this</h2>
+<ul>
+<li><strong>Visibility:</strong> without this, confirming what changed in production requires manually checking the Azure Portal or running ad-hoc queries.</li>
+<li><strong>Audit trail:</strong> every day's snapshot is kept permanently, giving a historical record of the environment over time — useful for troubleshooting, compliance, or change verification.</li>
+<li><strong>No manual effort:</strong> runs on its own schedule; nobody needs to log in and check anything unless they want to review the output.</li>
+<li><strong>Safe by design:</strong> it only <em>reads</em> our environment and <em>writes</em> to a storage location we control — it cannot accidentally change or delete anything in production (explained further in Section 5).</li>
+</ul>
+<hr />
+<h2 id="3-how-it-works-high-level-flow">3. How it works (high-level flow)</h2>
+<pre><code> Every day at 6:00 PM SGT
+          │
+          ▼
+ ┌─────────────────────────┐
+ │ 1. Query Azure for every  │   READ-ONLY
+ │    resource's details      │
+ └───────────┬─────────────┘
+             │
+             ▼
+ ┌─────────────────────────┐
+ │ 2. Save today's inventory │   WRITE (to our storage account only)
+ └───────────┬─────────────┘
+             │
+             ▼
+ ┌─────────────────────────┐
+ │ 3. Compare to yesterday's │   No Azure calls — pure calculation
+ │    inventory               │
+ └───────────┬─────────────┘
+             │
+             ▼
+ ┌─────────────────────────┐
+ │ 4. Draw a diagram + table  │   No Azure calls — pure calculation
+ │    of what changed          │
+ └───────────┬─────────────┘
+             │
+             ▼
+ ┌─────────────────────────┐
+ │ 5. Save the diagram +      │   WRITE (to our storage account only)
+ │    report                  │
+ └─────────────────────────┘
+</code></pre>
+<hr />
+<h2 id="4-tools-and-technology-used">4. Tools and technology used</h2>
+<table>
+<thead>
+<tr>
+<th>Tool / Service</th>
+<th>What it's for</th>
+<th>Why we chose it</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><strong>Azure Resource Graph</strong></td>
+<td>The Azure service that lets us query "show me every resource and its details" quickly, across the whole environment</td>
+<td>Fastest, most complete way to inventory resources — far quicker than checking each resource type individually</td>
+</tr>
+<tr>
+<td><strong>Azure Blob Storage</strong></td>
+<td>Where the daily snapshots, change reports, and diagrams get saved</td>
+<td>Simple, cheap, and we already have a storage account in use</td>
+</tr>
+<tr>
+<td><strong>Azure Functions</strong></td>
+<td>The compute service that runs our code automatically on a timer, without needing a server that's always on</td>
+<td>"Serverless" — we only pay for the few seconds per day it actually runs, and there's no server to patch or maintain</td>
+</tr>
+<tr>
+<td><strong>Python</strong></td>
+<td>The programming language the logic is written in</td>
+<td>Well-suited for this kind of data processing, and has mature libraries for talking to Azure and generating images</td>
+</tr>
+<tr>
+<td><strong>Managed Identity</strong></td>
+<td>An Azure-managed "credential" tied to our Function App, used instead of a stored password/key</td>
+<td>No secrets stored anywhere in the code — Azure handles authentication securely on its own</td>
+</tr>
+<tr>
+<td><strong>Microsoft's official Azure icon set</strong></td>
+<td>The visual icons used in the diagram (VM, Virtual Network, etc.)</td>
+<td>So the diagram looks consistent with what people already recognize from the Azure Portal</td>
+</tr>
+</tbody>
+</table>
+<hr />
+<h2 id="5-where-it-reads-vs-where-it-writes-the-safety-boundary">5. Where it reads vs. where it writes (the safety boundary)</h2>
+<p>This is the most important section for understanding risk:</p>
+<table>
+<thead>
+<tr>
+<th>Action</th>
+<th>Read or Write?</th>
+<th>Scope</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Querying resource details via Resource Graph</td>
+<td><strong>Read only</strong></td>
+<td>Can see resource names, types, configurations — <strong>cannot</strong> create, modify, or delete anything</td>
+</tr>
+<tr>
+<td>Saving snapshot/diff/diagram files</td>
+<td><strong>Write</strong></td>
+<td>Limited to specific containers inside <strong>one storage account we designated</strong> — nothing else</td>
+</tr>
+</tbody>
+</table>
+<p><strong>What it can never do, by design:</strong>
+- Create, modify, or delete any Azure resource (VM, network, storage account, etc.)
+- Create a resource group, subscription-level setting, or any infrastructure
+- Write to any storage location other than the specific containers we set up for it</p>
+<p>The only permission granted to this tool's identity is:
+- <strong>Reader</strong> role on the subscription (view-only)
+- <strong>Storage Blob Data Contributor</strong> role, scoped to just the one storage account it writes to</p>
+<p>This is a deliberate "least privilege" design — the tool literally does not have the technical ability to change production resources, even if the code had a bug.</p>
+<hr />
+<h2 id="6-why-azure-functions-specifically-not-a-vm-not-a-manual-script">6. Why Azure Functions specifically (not a VM, not a manual script)</h2>
+<table>
+<thead>
+<tr>
+<th>Option</th>
+<th>Downside</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Running it manually on someone's laptop</td>
+<td>Requires a person to remember and run it daily; stops working if that laptop is off/unavailable</td>
+</tr>
+<tr>
+<td>A dedicated always-on virtual machine</td>
+<td>Costs money 24/7 even though the job only runs for a few seconds once a day; requires patching/maintenance</td>
+</tr>
+<tr>
+<td><strong>Azure Functions (what we chose)</strong></td>
+<td>Runs automatically on schedule, costs effectively <strong>$0/month</strong> at this usage level (well within Azure's free monthly allowance), no server to maintain</td>
+</tr>
+</tbody>
+</table>
+<hr />
+<h2 id="7-prerequisites-and-dependencies">7. Prerequisites and dependencies</h2>
+<p><strong>Already required to be in place before this can run:</strong>
+- An Azure subscription with resources in it (the thing being monitored)
+- A storage account with three folders ("containers") already created: for snapshots, change reports, and diagrams
+- Someone with permission to create a Function App and assign it the two roles mentioned in Section 5 (a one-time setup step)</p>
+<p><strong>Tools needed on a developer's machine to set this up or make changes</strong> (not needed for it to keep running day-to-day):
+- Azure CLI (<code>az</code>) — command-line tool for managing Azure resources
+- Azure Functions Core Tools (<code>func</code>) — command-line tool for deploying code to a Function App
+- Python 3.11
+- VS Code or any code editor</p>
+<p><strong>Once deployed, none of the above are needed for the tool to keep running</strong> — it's fully automated from that point on.</p>
+<hr />
+<h2 id="8-cost">8. Cost</h2>
+<table>
+<thead>
+<tr>
+<th>Component</th>
+<th>Monthly cost</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Azure Functions (Consumption plan)</td>
+<td>~$0 — covered by Azure's free monthly execution allowance at this usage (once per day)</td>
+</tr>
+<tr>
+<td>Storage (a few KB/day of JSON + image files)</td>
+<td>Negligible — well under $1/month</td>
+</tr>
+</tbody>
+</table>
+<hr />
+<h2 id="9-what-management-should-know-for-oversightapproval-purposes">9. What management should know for oversight/approval purposes</h2>
+<ul>
+<li>The tool has <strong>no ability to modify production</strong> — its permissions are read-only against resources, write-only to our own reporting storage.</li>
+<li>It requires <strong>one-time setup</strong> (creating the Function App, granting two specific roles) — after that, it's fully automatic.</li>
+<li>The code and every configuration value is documented, including a step-by-step deployment runbook, so it can be reproduced, audited, or handed off to another team member if needed.</li>
+<li>It uses only <strong>official Microsoft-provided components</strong> (Azure services, official icon assets) — no third-party or unvetted tools involved.</li>
+</ul>
+</body>
+</html>

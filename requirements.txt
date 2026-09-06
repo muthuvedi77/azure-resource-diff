@@ -1,0 +1,4 @@
+azure-functions
+azure-identity
+azure-mgmt-resourcegraph
+azure-storage-blob

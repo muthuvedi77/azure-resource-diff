@@ -1,0 +1,545 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>Runbook — Azure Resource Diff Tool</title>
+<style>
+  body {
+    font-family: -apple-system, Segoe UI, Arial, sans-serif;
+    max-width: 900px;
+    margin: 40px auto;
+    padding: 0 20px;
+    line-height: 1.6;
+    color: #1f2328;
+  }
+  h1, h2, h3 { color: #0969da; border-bottom: 1px solid #d0d7de; padding-bottom: 6px; }
+  code {
+    background: #f6f8fa;
+    padding: 2px 6px;
+    border-radius: 4px;
+    font-family: Consolas, monospace;
+    font-size: 0.9em;
+  }
+  pre {
+    background: #f6f8fa;
+    padding: 14px;
+    border-radius: 8px;
+    overflow-x: auto;
+    border: 1px solid #d0d7de;
+  }
+  pre code { background: none; padding: 0; }
+  table { border-collapse: collapse; width: 100%; margin: 16px 0; }
+  th, td { border: 1px solid #d0d7de; padding: 8px 12px; text-align: left; }
+  th { background: #f6f8fa; }
+  blockquote { border-left: 4px solid #d0d7de; margin: 0; padding-left: 16px; color: #57606a; }
+  strong { color: #24292f; }
+</style>
+</head>
+<body>
+<h1 id="runbook-azure-resource-diff-diagram-tool">Runbook — Azure Resource Diff &amp; Diagram Tool</h1>
+<p><strong>Your deployed environment:</strong></p>
+<table>
+<thead>
+<tr>
+<th>Value</th>
+<th>Setting</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Resource Group</td>
+<td><code>rg-terraform-state</code></td>
+</tr>
+<tr>
+<td>Storage Account</td>
+<td><code>sttfstatemigration</code></td>
+</tr>
+<tr>
+<td>Function App name</td>
+<td><code>functionapp1-mtdiff4728</code></td>
+</tr>
+<tr>
+<td>Subscription ID</td>
+<td><code>317b92c9-a532-4f6a-80f2-abe8b6770eb4</code></td>
+</tr>
+<tr>
+<td>Region</td>
+<td><code>southeastasia</code></td>
+</tr>
+<tr>
+<td>Schedule</td>
+<td><code>16:00 UTC</code> daily = <strong>12:00 AM (Midnight) Singapore Time</strong></td>
+</tr>
+</tbody>
+</table>
+<p>Every command below states its <strong>purpose</strong> so you know what it does and why it's there — not just what to type.</p>
+<hr />
+<h2 id="part-a-one-time-setup-already-completed-kept-here-for-referenceredeploying-elsewhere">Part A — One-time setup (already completed, kept here for reference/redeploying elsewhere)</h2>
+<h3 id="1-confirm-blob-containers-exist">1. Confirm blob containers exist</h3>
+<pre><code class="language-bash">az storage container list --account-name sttfstatemigration --output table
+</code></pre>
+<p><strong>Purpose:</strong> verifies <code>snapshots</code>, <code>diffs</code>, <code>diagrams</code> already exist. The tool never creates containers itself — it fails with a clear error if one is missing, by design (see Part F).</p>
+<h3 id="2-register-the-web-resource-provider-once-per-subscription">2. Register the Web resource provider (once per subscription)</h3>
+<pre><code class="language-bash">az provider register --namespace Microsoft.Web
+az provider show --namespace Microsoft.Web --query registrationState -o tsv
+</code></pre>
+<p><strong>Purpose:</strong> Azure Functions/App Service resources live under the <code>Microsoft.Web</code> namespace. A subscription that's never used Functions before needs this "switched on" first — a one-time, free, non-resource-creating action. Repeat the second command until it shows <code>Registered</code>.</p>
+<h3 id="3-create-the-function-app">3. Create the Function App</h3>
+<pre><code class="language-bash">az functionapp create \
+  --name functionapp1-mtdiff4728 \
+  --resource-group rg-terraform-state \
+  --storage-account sttfstatemigration \
+  --consumption-plan-location southeastasia \
+  --runtime python \
+  --runtime-version 3.11 \
+  --functions-version 4 \
+  --os-type Linux
+</code></pre>
+<p><strong>Purpose:</strong> creates the compute shell that will run your Python code on a timer. <code>functionapp1</code> alone was already taken by someone else globally (names must be unique across <em>all</em> of Azure) — <code>functionapp1-mtdiff4728</code> is the actual name that succeeded.</p>
+<h3 id="4-assign-the-function-app-a-managed-identity">4. Assign the Function App a managed identity</h3>
+<pre><code class="language-bash">az functionapp identity assign --name functionapp1-mtdiff4728 --resource-group rg-terraform-state
+
+PRINCIPAL_ID=$(az functionapp identity show --name functionapp1-mtdiff4728 --resource-group rg-terraform-state --query principalId -o tsv)
+echo $PRINCIPAL_ID
+</code></pre>
+<p><strong>Purpose:</strong> creates an Azure-managed "robot identity" tied to this Function App, so the deployed code can authenticate without any stored password/key. <code>echo</code> confirms it worked — must print a GUID.</p>
+<h3 id="5-grant-minimum-permissions">5. Grant minimum permissions</h3>
+<pre><code class="language-bash">MSYS_NO_PATHCONV=1 az role assignment create \
+  --assignee-object-id &quot;$PRINCIPAL_ID&quot; \
+  --assignee-principal-type ServicePrincipal \
+  --role &quot;Reader&quot; \
+  --scope &quot;/subscriptions/317b92c9-a532-4f6a-80f2-abe8b6770eb4&quot;
+</code></pre>
+<p><strong>Purpose:</strong> gives the identity <strong>read-only</strong> visibility into the subscription — the minimum required for Resource Graph queries. <code>MSYS_NO_PATHCONV=1</code> stops Git Bash from mangling the <code>/subscriptions/...</code> path into a Windows-style path. <code>--assignee-object-id</code> + <code>--assignee-principal-type</code> avoids a lookup failure that plain <code>--assignee</code> hits on brand-new identities.</p>
+<pre><code class="language-bash">STORAGE_ID=$(az storage account show --name sttfstatemigration --resource-group rg-terraform-state --query id -o tsv)
+
+MSYS_NO_PATHCONV=1 az role assignment create \
+  --assignee-object-id &quot;$PRINCIPAL_ID&quot; \
+  --assignee-principal-type ServicePrincipal \
+  --role &quot;Storage Blob Data Contributor&quot; \
+  --scope &quot;$STORAGE_ID&quot;
+</code></pre>
+<p><strong>Purpose:</strong> gives the identity write access, but <strong>scoped only to this one storage account</strong> — not the whole subscription — so it can upload snapshots/diffs/diagrams and nothing more.</p>
+<h3 id="6-set-the-storage-connection-string">6. Set the storage connection string</h3>
+<pre><code class="language-bash">CONN_STR=$(az storage account show-connection-string \
+  --name sttfstatemigration \
+  --resource-group rg-terraform-state \
+  --query connectionString -o tsv)
+echo ${#CONN_STR}
+
+az functionapp config appsettings set \
+  --name functionapp1-mtdiff4728 \
+  --resource-group rg-terraform-state \
+  --settings STORAGE_CONNECTION_STRING=&quot;$CONN_STR&quot;
+</code></pre>
+<p><strong>Purpose:</strong> tells the deployed code which storage account to write results into. Loading into <code>$CONN_STR</code> first (rather than pasting the raw string directly) avoids Git Bash mangling the semicolon-separated string — this was the actual cause of a <code>ValueError: Connection string is either blank or malformed</code> failure during setup. <code>echo ${#CONN_STR}</code> should print ~250-300 to confirm the string is intact before using it.</p>
+<h3 id="7-set-the-remaining-app-settings">7. Set the remaining app settings</h3>
+<pre><code class="language-bash">az functionapp config appsettings set \
+  --name functionapp1-mtdiff4728 \
+  --resource-group rg-terraform-state \
+  --settings \
+    CONTAINER_SNAPSHOTS=&quot;snapshots&quot; \
+    CONTAINER_DIFFS=&quot;diffs&quot; \
+    CONTAINER_DIAGRAMS=&quot;diagrams&quot; \
+    SUBSCRIPTION_IDS=&quot;317b92c9-a532-4f6a-80f2-abe8b6770eb4&quot;
+</code></pre>
+<p><strong>Purpose:</strong> tells the code which containers to use and which subscription to scan.</p>
+<h3 id="8-confirm-the-schedule">8. Confirm the schedule</h3>
+<pre><code class="language-bash">cat /c/Projects/azure-resource-diff/snapshot_function/function.json
+</code></pre>
+<p><strong>Purpose:</strong> verifies the timer is set to <code>"schedule": "0 0 16 * * *"</code> (16:00 UTC = 12:00 AM Midnight Singapore Time) before deploying. If this errors with "No such file," you likely have a nested duplicate folder from re-extracting a zip — check with <code>ls /c/Projects/azure-resource-diff</code> and flatten if needed.</p>
+<h3 id="9-install-azure-functions-core-tools">9. Install Azure Functions Core Tools</h3>
+<pre><code class="language-bash">winget install Microsoft.Azure.FunctionsCoreTools
+</code></pre>
+<p><strong>Purpose:</strong> installs the <code>func</code> CLI — a separate tool from <code>az</code>, specifically needed to package and upload your Python code into the Function App. <strong>Close and reopen Git Bash completely</strong> afterward, then confirm with <code>func --version</code>.</p>
+<h3 id="10-deploy-the-code">10. Deploy the code</h3>
+<pre><code class="language-bash">cd /c/Projects/azure-resource-diff
+func azure functionapp publish functionapp1-mtdiff4728 --python
+</code></pre>
+<p><strong>Purpose:</strong> the actual "make it run" step — zips your code and remotely installs <code>requirements.txt</code> inside the Function App. This is separate from provisioning; Terraform/<code>az</code> has no concept of "your application logic."</p>
+<h3 id="11-confirm-deployment-succeeded">11. Confirm deployment succeeded</h3>
+<pre><code class="language-bash">az functionapp function list --name functionapp1-mtdiff4728 --resource-group rg-terraform-state --output table
+</code></pre>
+<p><strong>Purpose:</strong> confirms <code>snapshot_function</code> is actually registered inside the deployed app, with <code>IsDisabled: False</code>.</p>
+<hr />
+<h2 id="part-b-how-to-manually-trigger-a-test-run-any-time">Part B — How to manually trigger a test run (any time)</h2>
+<h3 id="1-get-the-master-key">1. Get the master key</h3>
+<pre><code class="language-bash">az functionapp keys list \
+  --name functionapp1-mtdiff4728 \
+  --resource-group rg-terraform-state \
+  --query masterKey -o tsv
+</code></pre>
+<p><strong>Purpose:</strong> retrieves the credential needed to call the function's admin trigger endpoint directly.</p>
+<h3 id="2-trigger-the-function-immediately">2. Trigger the function immediately</h3>
+<pre><code class="language-bash">curl -X POST \
+  &quot;https://functionapp1-mtdiff4728.azurewebsites.net/admin/functions/snapshot_function&quot; \
+  -H &quot;x-functions-key: &lt;paste master key&gt;&quot; \
+  -H &quot;Content-Type: application/json&quot; \
+  -d '{}'
+</code></pre>
+<p><strong>Purpose:</strong> forces one run right now instead of waiting for the 6pm schedule. <code>az functionapp function invoke</code> is <strong>not</strong> a real command — this Admin API call is the correct method. An empty response is normal; it doesn't print a confirmation even on success.</p>
+<h3 id="3-confirm-it-ran">3. Confirm it ran</h3>
+<pre><code class="language-bash">az storage blob list --account-name sttfstatemigration --container-name snapshots --output table
+az storage blob list --account-name sttfstatemigration --container-name diffs --output table
+az storage blob list --account-name sttfstatemigration --container-name diagrams --output table
+</code></pre>
+<p><strong>Purpose:</strong> looks for today's date with a fresh "Last Modified" timestamp in each container — proof the whole pipeline (query → snapshot → diff → diagram → upload) completed successfully.</p>
+<hr />
+<h2 id="part-c-how-to-test-change-detection-added-deleted-resources">Part C — How to test change-detection (added / deleted resources)</h2>
+<p>This is the exact sequence that confirmed both Added and Deleted detection work correctly.</p>
+<h3 id="test-an-addition">Test an addition</h3>
+<pre><code class="language-bash">az network vnet create \
+  --name Test-Vnet-3 \
+  --resource-group Test-RG-Automation \
+  --address-prefix 10.1.0.0/16 \
+  --subnet-name default \
+  --subnet-prefix 10.1.0.0/24 \
+  --location southeastasia
+</code></pre>
+<p><strong>Purpose:</strong> creates a small, disposable resource to prove the tool detects new resources. Wait 30-60 seconds for Resource Graph to index it before triggering the function (Part B).</p>
+<h3 id="test-a-deletion">Test a deletion</h3>
+<pre><code class="language-bash">az network vnet delete --name Test-Vnet-3 --resource-group Test-RG-Automation
+</code></pre>
+<p><strong>Purpose:</strong> removes the test resource. For the <em>next</em> run to correctly show it as "Removed," the snapshot <strong>immediately before</strong> this deletion must already contain it — i.e., trigger the function once <em>before</em> deleting (capturing it as present), then delete, then trigger again (capturing it as gone). A deletion can only be detected between two of the tool's own real snapshots — anything deleted before the tool ever ran is invisible to it (expected behavior, not a bug).</p>
+<h3 id="check-the-diff-after-either-test">Check the diff after either test</h3>
+<pre><code class="language-bash">az storage blob download --account-name sttfstatemigration --container-name diffs --name &quot;&lt;todays-date&gt;-diff.json&quot; --file diff-check.json
+cat diff-check.json
+</code></pre>
+<p><strong>Purpose:</strong> confirms detection at the data level — look for the resource under <code>"added"</code> or <code>"removed"</code>, and check <code>summary.added_count</code> / <code>summary.removed_count</code>.</p>
+<h3 id="view-the-diagram">View the diagram</h3>
+<pre><code class="language-bash">az storage blob download --account-name sttfstatemigration --container-name diagrams --name &quot;&lt;todays-date&gt;-diagram.svg&quot; --file diagram-check.svg
+start diagram-check.svg
+</code></pre>
+<p><strong>Purpose:</strong> confirms the visual output — the resource should appear color-coded (green border = Added) in the dependency graph, and listed in the correct column of the 3-column table at the bottom (Current Network Resources / Newly Added / Newly Deleted).</p>
+<hr />
+<h2 id="part-d-ongoing-health-checks">Part D — Ongoing health checks</h2>
+<h3 id="quick-check-did-todays-scheduled-run-happen">Quick check: did today's scheduled run happen?</h3>
+<pre><code class="language-bash">az storage blob list --account-name sttfstatemigration --container-name diagrams --output table
+</code></pre>
+<p><strong>Purpose:</strong> confirms the 6pm automatic trigger fired — look for today's date with a recent timestamp.</p>
+<h3 id="check-for-errors-if-a-run-seems-to-have-failed">Check for errors, if a run seems to have failed</h3>
+<p>Portal → search <strong>Application Insights</strong> → click <code>functionapp1-mtdiff4728</code> → <strong>Logs</strong>, then run:</p>
+<pre><code class="language-kusto">exceptions
+| where timestamp &gt; ago(1h)
+| order by timestamp desc
+| project timestamp, problemId, outerMessage, details
+</code></pre>
+<p><strong>Purpose:</strong> the Function App's own Functions/Monitor tab isn't always visible depending on the portal view — Application Insights Logs reliably shows every exception with full detail.</p>
+<hr />
+<h2 id="part-e-rotating-the-storage-key-if-ever-exposed">Part E — Rotating the storage key (if ever exposed)</h2>
+<pre><code class="language-bash">az storage account keys renew --account-name sttfstatemigration --resource-group rg-terraform-state --key primary
+az storage account keys renew --account-name sttfstatemigration --resource-group rg-terraform-state --key secondary
+</code></pre>
+<p><strong>Purpose:</strong> invalidates any previously-exposed key. After rotating, repeat <strong>Part A, Step 6</strong> (re-fetch connection string into <code>$CONN_STR</code>, then update the app setting) — the deployed function stops working until this is redone, since it's still holding the old key.</p>
+<hr />
+<h2 id="part-f-design-principle-why-some-steps-look-the-way-they-do">Part F — Design principle (why some steps look the way they do)</h2>
+<p>This tool is intentionally <strong>read-only against your Azure resources</strong>:
+- It only ever reads via Resource Graph (<code>Reader</code> role — no write/modify permissions on production resources, ever)
+- It only ever writes blobs into containers <strong>you</strong> created in advance
+- It does <strong>not</strong> auto-create containers, resource groups, VMs, or anything else — if a container is missing, it errors with a clear message instead of creating one</p>
+<p>The Function App itself (Part A) is the one piece of infrastructure this setup needs to exist — that's the tool's own hosting shell, provisioned once by you, and is separate from the production resources being monitored.</p>
+<hr />
+<h2 id="part-g-full-diagnosis-table">Part G — Full diagnosis table</h2>
+<table>
+<thead>
+<tr>
+<th>#</th>
+<th>Symptom</th>
+<th>Cause</th>
+<th>Fix</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>1</td>
+<td><code>MissingSubscriptionRegistration ... Microsoft.Web</code></td>
+<td>Subscription never used Azure Functions before</td>
+<td><code>az provider register --namespace Microsoft.Web</code></td>
+</tr>
+<tr>
+<td>2</td>
+<td><code>Website with given name functionapp1 already exists</code></td>
+<td>Function App names are globally unique across all of Azure</td>
+<td>Use a more unique name</td>
+</tr>
+<tr>
+<td>3</td>
+<td><code>Cannot find user or service principal in graph database</code></td>
+<td>Plain <code>--assignee</code> fails on a brand-new managed identity</td>
+<td>Use <code>--assignee-object-id</code> + <code>--assignee-principal-type ServicePrincipal</code></td>
+</tr>
+<tr>
+<td>4</td>
+<td><code>MissingSubscription: The request did not have a subscription...</code></td>
+<td>Git Bash rewrites <code>/subscriptions/...</code> into a Windows path</td>
+<td>Prefix with <code>MSYS_NO_PATHCONV=1</code></td>
+</tr>
+<tr>
+<td>5</td>
+<td><code>ResourceNotFound ... functionapp1</code></td>
+<td>Typed the old (taken) name instead of the real one</td>
+<td>Always use <code>functionapp1-mtdiff4728</code></td>
+</tr>
+<tr>
+<td>6</td>
+<td><code>cat: function.json: No such file or directory</code></td>
+<td>Nested duplicate folder from re-extracting a zip</td>
+<td>Check with <code>ls</code>, flatten with <code>mv</code>/<code>rmdir</code></td>
+</tr>
+<tr>
+<td>7</td>
+<td><code>bash: func: command not found</code></td>
+<td>Functions Core Tools is separate from Azure CLI</td>
+<td><code>winget install Microsoft.Azure.FunctionsCoreTools</code>, reopen terminal</td>
+</tr>
+<tr>
+<td>8</td>
+<td><code>'invoke' is misspelled or not recognized</code></td>
+<td><code>az functionapp function invoke</code> isn't a real command</td>
+<td>Use the Admin API via <code>curl</code> + master key</td>
+</tr>
+<tr>
+<td>9</td>
+<td><code>ValueError: Connection string is either blank or malformed</code></td>
+<td>Raw string mangled when pasted directly into <code>--settings</code></td>
+<td>Load into <code>$CONN_STR</code> first, then use <code>"$CONN_STR"</code></td>
+</tr>
+<tr>
+<td>10</td>
+<td>Diff shows a deletion as missing (<code>removed: []</code>) even though a resource was deleted</td>
+<td>The resource was deleted <strong>before</strong> the tool's very first snapshot — nothing to compare it against</td>
+<td>Expected behavior; only deletions happening <em>between two of the tool's own snapshots</em> can be detected</td>
+</tr>
+<tr>
+<td>11</td>
+<td>Manual trigger via <code>curl</code> with <code>-H "x-functions-key: ..."</code> header keeps returning <code>401 Unauthorized</code> with <code>WWW-Authenticate: Bearer</code>, even with a correct key and Easy Auth confirmed <strong>off</strong></td>
+<td>This specific admin route (<code>/admin/functions/&lt;name&gt;</code>) doesn't reliably accept the key as a header on this app/environment</td>
+<td>Pass the key as a <strong>query parameter</strong> instead: <code>.../admin/functions/snapshot_function?code=$MASTER_KEY</code> — this succeeded (<code>202 Accepted</code>) where the header form kept failing</td>
+</tr>
+<tr>
+<td>12</td>
+<td>Redeploying and re-triggering repeatedly produces the <strong>same diagram, same timestamp</strong>, no matter what</td>
+<td>Local <code>snapshot_function/__init__.py</code> was an <strong>older version</strong> — <code>func publish</code> was deploying outdated code correctly, so nothing looked "wrong" in the deploy logs themselves</td>
+<td>Before redeploying, always verify the local file actually has the latest change: <code>grep -c "&lt;a string unique to the latest update&gt;" snapshot_function/__init__.py</code> and confirm it's non-zero before running <code>func publish</code></td>
+</tr>
+<tr>
+<td>13</td>
+<td>Commands suddenly fail with "No such file or directory" for paths that worked minutes earlier</td>
+<td>Terminal prompt had silently changed to a <strong>different machine</strong> (e.g. <code>azureuser@terraform-vm</code> instead of <code>hp@DESKTOP-80492DK</code>) — likely from an earlier SSH/remote session left open</td>
+<td>Always check the prompt / run <code>hostname</code> if a previously-working path suddenly "disappears"</td>
+</tr>
+<tr>
+<td>14</td>
+<td>A pasted <code>curl</code> command with a stored key variable shows an extra stray character (e.g. <code>$2AkgwbU...</code>) in the request</td>
+<td>Manual retyping/copy-paste of a shell variable reference introduced an accidental character before the <code>$</code></td>
+<td>Always reference the key purely by variable (<code>"$MASTER_KEY"</code>), never retype or partially copy the expanded value; verify with <code>echo "Key length: ${#MASTER_KEY}"</code> before using it</td>
+</tr>
+<tr>
+<td>15</td>
+<td>Icon files exist locally, deploy succeeds, but the diagram still shows colored-glyph circles instead of real icons</td>
+<td>Local folder was named <code>Icons</code> (capital "I"); Windows is case-insensitive so this looked fine locally, but the deployed <strong>Linux</strong> container is case-sensitive and the code looks for lowercase <code>icons</code></td>
+<td>Rename the folder to exactly <code>icons</code> (<code>mv Icons icons</code>), then redeploy — confirmed by the diagram's file size roughly tripling (~8.7KB → ~28KB) once real icon images are embedded</td>
+</tr>
+</tbody>
+</table>
+<hr />
+<h2 id="part-h-container-reference-whats-in-the-storage-account-and-who-put-it-there">Part H — Container reference: what's in the storage account, and who put it there</h2>
+<p>Since <code>sttfstatemigration</code> is a <strong>reused, pre-existing</strong> storage account (originally for Terraform state), it holds a mix of containers — some are ours, some pre-existed, and some were auto-created by Azure Functions itself. Knowing which is which matters for cleanup (Part I) and for not accidentally touching something unrelated.</p>
+<table>
+<thead>
+<tr>
+<th>Container</th>
+<th>Created by</th>
+<th>Purpose</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>snapshots</code></td>
+<td><strong>Our tool</strong></td>
+<td>Daily resource inventory JSON files</td>
+</tr>
+<tr>
+<td><code>diffs</code></td>
+<td><strong>Our tool</strong></td>
+<td>Daily change reports — <code>.json</code> (machine-readable) + <code>.md</code> (human-readable)</td>
+</tr>
+<tr>
+<td><code>diagrams</code></td>
+<td><strong>Our tool</strong></td>
+<td>Daily dependency-graph SVG diagrams with the 3-column change table</td>
+</tr>
+<tr>
+<td><code>tfstate</code></td>
+<td><strong>Pre-existing</strong> (before this project)</td>
+<td>Terraform's own state file storage — this is the original reason this storage account/resource group exists. <strong>Not related to our tool.</strong></td>
+</tr>
+<tr>
+<td><code>azure-webjobs-hosts</code></td>
+<td>Auto-created by Azure Functions runtime</td>
+<td>Internal bookkeeping — timer schedule state, locks, "last run" tracking</td>
+</tr>
+<tr>
+<td><code>azure-webjobs-secrets</code></td>
+<td>Auto-created by Azure Functions runtime</td>
+<td>Stores the Function App's internal keys (e.g. the master key used to trigger it manually)</td>
+</tr>
+<tr>
+<td><code>scm-releases</code></td>
+<td>Auto-created during deployment</td>
+<td>Holds a history of the zip packages uploaded by each <code>func azure functionapp publish</code></td>
+</tr>
+<tr>
+<td><code>$logs</code></td>
+<td>Auto-created by Azure Storage</td>
+<td>System-level storage diagnostic logs — a default Storage feature, unrelated to our tool</td>
+</tr>
+</tbody>
+</table>
+<p><strong>⚠️ Never delete <code>tfstate</code> or <code>$logs</code></strong> — both are unrelated to this project and deleting <code>tfstate</code> could break existing Terraform-managed infrastructure elsewhere.</p>
+<hr />
+<h2 id="part-i-full-teardown-destroy-everything-this-project-created">Part I — Full teardown (destroy everything this project created)</h2>
+<p><strong>Do NOT delete:</strong> <code>rg-terraform-state</code> (resource group) or <code>sttfstatemigration</code> (storage account) themselves — both existed before this project; we only reused them.</p>
+<h3 id="1-delete-the-function-app">1. Delete the Function App</h3>
+<pre><code class="language-bash">az functionapp delete --name functionapp1-mtdiff4728 --resource-group rg-terraform-state
+</code></pre>
+<p><strong>Purpose:</strong> removes the Function App and its managed identity (usually removes its Consumption plan automatically too).</p>
+<h3 id="2-confirm-the-app-service-plan-is-gone">2. Confirm the App Service Plan is gone</h3>
+<pre><code class="language-bash">az functionapp plan list --resource-group rg-terraform-state --output table
+</code></pre>
+<p>If a leftover plan remains with no apps using it:</p>
+<pre><code class="language-bash">az functionapp plan delete --name &lt;plan-name-shown-above&gt; --resource-group rg-terraform-state --yes
+</code></pre>
+<h3 id="3-delete-the-application-insights-component">3. Delete the Application Insights component</h3>
+<pre><code class="language-bash">az monitor app-insights component delete --app functionapp1-mtdiff4728 --resource-group rg-terraform-state
+</code></pre>
+<h3 id="4-clean-up-orphaned-role-assignments-optional-good-hygiene">4. Clean up orphaned role assignments (optional, good hygiene)</h3>
+<pre><code class="language-bash">az role assignment list --resource-group rg-terraform-state --output table
+</code></pre>
+<p>Delete any tied to the now-deleted identity:</p>
+<pre><code class="language-bash">az role assignment delete --ids &lt;assignment-id-shown-above&gt;
+</code></pre>
+<h3 id="5-delete-the-test-resource-group-if-it-still-exists">5. Delete the test resource group (if it still exists)</h3>
+<pre><code class="language-bash">az group delete --name Test-RG-Automation --yes --no-wait
+</code></pre>
+<h3 id="6-clean-up-the-functions-runtime-created-containers-part-h">6. Clean up the Functions-runtime-created containers (Part H)</h3>
+<pre><code class="language-bash">az storage container delete --account-name sttfstatemigration --name azure-webjobs-hosts
+az storage container delete --account-name sttfstatemigration --name azure-webjobs-secrets
+az storage container delete --account-name sttfstatemigration --name scm-releases
+</code></pre>
+<h3 id="7-clear-out-our-own-data-containers-optional-keeps-containers-empties-contents-for-a-clean-rebuild">7. Clear out our own data containers (optional — keeps containers, empties contents for a clean rebuild)</h3>
+<pre><code class="language-bash">az storage blob delete-batch --account-name sttfstatemigration --source snapshots
+az storage blob delete-batch --account-name sttfstatemigration --source diffs
+az storage blob delete-batch --account-name sttfstatemigration --source diagrams
+</code></pre>
+<h3 id="8-verify-everythings-clean">8. Verify everything's clean</h3>
+<pre><code class="language-bash">az functionapp list --resource-group rg-terraform-state --output table
+az group show --name Test-RG-Automation --output table
+az storage blob list --account-name sttfstatemigration --container-name diagrams --output table
+</code></pre>
+<p>First two should return empty/error (gone); last should show an empty list.</p>
+<p><strong>Cost note:</strong> at this usage level (a handful of manual test runs over a couple of days, no VMs, no gateways/public IPs), the actual cost impact of everything this project created is realistically <strong>$0.00–$0.05 USD</strong> — Azure Functions Consumption plan, Application Insights, and blob storage all fall well within their free monthly allowances at this scale.</p>
+<hr />
+<h2 id="part-k-which-resource-types-the-diagram-recognizes-and-how-to-add-more">Part K — Which resource types the diagram recognizes (and how to add more)</h2>
+<h3 id="the-diffchange-table-logic-tracks-every-resource-type-automatically">The diff/change-table logic tracks EVERY resource type automatically</h3>
+<p>"Added / Removed / Modified" and the "Current Network Resources" table column work on <strong>any</strong> resource in your subscription, with no hardcoded list — VNets, Subnets-as-part-of-a-VNet, Application Gateways, Firewalls, anything at all shows up correctly there.</p>
+<h3 id="the-diagrams-icons-relationship-arrows-only-recognize-a-fixed-set-of-9-types">The diagram's icons + relationship arrows only recognize a fixed set of 9 types</h3>
+<p>These live in <code>snapshot_function/__init__.py</code>, in two places that must be kept in sync:</p>
+<p><strong>1. <code>TYPE_STYLE</code> (~line 212)</strong> — fallback colored circle + glyph, used if no icon file exists:</p>
+<pre><code class="language-python">TYPE_STYLE = {
+    &quot;microsoft.compute/virtualmachines&quot;:       {&quot;glyph&quot;: &quot;VM&quot;,  &quot;color&quot;: &quot;#0078d4&quot;},
+    &quot;microsoft.compute/disks&quot;:                 {&quot;glyph&quot;: &quot;DISK&quot;, &quot;color&quot;: &quot;#106ebe&quot;},
+    &quot;microsoft.network/networkinterfaces&quot;:     {&quot;glyph&quot;: &quot;NIC&quot;, &quot;color&quot;: &quot;#107c10&quot;},
+    &quot;microsoft.network/virtualnetworks&quot;:       {&quot;glyph&quot;: &quot;VNET&quot;, &quot;color&quot;: &quot;#00b294&quot;},
+    &quot;microsoft.network/publicipaddresses&quot;:     {&quot;glyph&quot;: &quot;IP&quot;,  &quot;color&quot;: &quot;#5c2d91&quot;},
+    &quot;microsoft.network/networksecuritygroups&quot;: {&quot;glyph&quot;: &quot;NSG&quot;, &quot;color&quot;: &quot;#005a9e&quot;},
+    &quot;microsoft.network/networkwatchers&quot;:       {&quot;glyph&quot;: &quot;NW&quot;,  &quot;color&quot;: &quot;#00bcf2&quot;},
+    &quot;microsoft.storage/storageaccounts&quot;:       {&quot;glyph&quot;: &quot;ST&quot;,  &quot;color&quot;: &quot;#00838f&quot;},
+    &quot;microsoft.resources/subscriptions/resourcegroups&quot;: {&quot;glyph&quot;: &quot;RG&quot;, &quot;color&quot;: &quot;#8c959f&quot;},
+}
+</code></pre>
+<p><strong>2. <code>ICON_FILES</code> (~line 233)</strong> — maps the same types to official Azure icon filenames (see Part A/icon setup):</p>
+<pre><code class="language-python">ICON_FILES = {
+    &quot;microsoft.compute/virtualmachines&quot;:       &quot;virtual-machine.svg&quot;,
+    &quot;microsoft.compute/disks&quot;:                 &quot;disk.svg&quot;,
+    &quot;microsoft.network/networkinterfaces&quot;:     &quot;network-interface.svg&quot;,
+    &quot;microsoft.network/virtualnetworks&quot;:       &quot;virtual-network.svg&quot;,
+    &quot;microsoft.network/publicipaddresses&quot;:     &quot;public-ip-address.svg&quot;,
+    &quot;microsoft.network/networksecuritygroups&quot;: &quot;network-security-group.svg&quot;,
+    &quot;microsoft.network/networkwatchers&quot;:       &quot;network-watcher.svg&quot;,
+    &quot;microsoft.storage/storageaccounts&quot;:       &quot;storage-account.svg&quot;,
+    &quot;microsoft.resources/subscriptions/resourcegroups&quot;: &quot;resource-group.svg&quot;,
+}
+</code></pre>
+<p><strong>What happens for a type NOT in either list</strong> (e.g. Application Gateway, Azure Firewall right now): it still appears in the diagram as a box, but with the generic <code>DEFAULT_TYPE_STYLE</code> gray "RES" circle, and <strong>no relationship arrows</strong> — because arrow-drawing depends on <code>_extract_edges()</code> (~line 284) knowing how to read that specific resource type's <code>properties</code> for references to other resources.</p>
+<h3 id="currently-not-tracked-with-arrowsicons-application-gateway-azure-firewall-subnets">Currently NOT tracked with arrows/icons: Application Gateway, Azure Firewall, Subnets</h3>
+<ul>
+<li><strong>Application Gateway</strong> (<code>microsoft.network/applicationgateways</code>) and <strong>Azure Firewall</strong> (<code>microsoft.network/azurefirewalls</code>) — appear as generic gray boxes; no icon, no arrows to their attached VNet/subnet/public IP yet.</li>
+<li><strong>Subnets</strong> — not a top-level Resource Graph entry at all; they live nested inside a VNet's <code>properties.subnets[]</code> array, so only the parent VNet shows as a node today, not each individual subnet.</li>
+</ul>
+<h3 id="to-add-a-new-resource-type-eg-application-gateway">To add a new resource type (e.g. Application Gateway)</h3>
+<ol>
+<li><strong>Add an icon file</strong> to <code>snapshot_function/icons/</code> (download from Microsoft's icon set, rename to e.g. <code>application-gateway.svg</code>)</li>
+<li><strong>Add one line to <code>TYPE_STYLE</code>:</strong>
+   <code>python
+   "microsoft.network/applicationgateways": {"glyph": "AGW", "color": "#8661c5"},</code></li>
+<li><strong>Add one line to <code>ICON_FILES</code>:</strong>
+   <code>python
+   "microsoft.network/applicationgateways": "application-gateway.svg",</code></li>
+<li><strong>(Optional, for arrows)</strong> extend <code>_extract_edges()</code> to parse that resource type's <code>properties</code> for references — e.g. an Application Gateway's <code>properties.gatewayIPConfigurations[].properties.subnet.id</code> would need similar handling to how NIC→VNet is currently resolved.</li>
+<li><strong>Redeploy:</strong>
+   <code>bash
+   cd /c/Projects/azure-resource-diff
+   func azure functionapp publish functionapp1-mtdiff4728 --python</code></li>
+</ol>
+<p>Without step 4, the new resource type will still show up correctly (with its own icon, correct Added/Removed/Modified coloring) — it just won't have arrows connecting it to related resources, which is often acceptable depending on what you need the diagram to show.</p>
+<hr />
+<h2 id="part-m-resolved-official-microsoft-azure-icon-images-now-appear-in-the-diagram">Part M — RESOLVED: Official Microsoft Azure icon images now appear in the diagram</h2>
+<p><strong>Final status:</strong> ✅ Fixed and confirmed working. The diagram now shows real Microsoft Azure icon artwork (not colored-glyph circles) for every resource type with an icon file present.</p>
+<h3 id="root-cause">Root cause</h3>
+<p><strong>Windows/Linux filesystem case-sensitivity.</strong> The local icons folder was created as <code>Icons</code> (capital "I") on Windows. Windows filesystems are case-insensitive, so <code>Icons</code> and <code>icons</code> are treated as identical locally — everything looked fine on the laptop. The deployed Function App runs on a <strong>Linux</strong> container, which <strong>is</strong> case-sensitive: the code's <code>ICON_DIR = os.path.join(os.path.dirname(__file__), "icons")</code> (lowercase) never matched the deployed <code>Icons</code> (capital) folder, so every icon lookup silently failed and fell back to the colored glyph — with no error thrown anywhere, which is why it took extensive debugging to surface.</p>
+<h3 id="how-it-was-found">How it was found</h3>
+<p>Temporary debug logging was added to <code>main()</code> to print <code>ICON_DIR</code>, whether it exists, and (if not) the parent folder's actual contents. Triggering the function and checking <strong>Application Insights → Logs</strong> (<code>traces | where message startswith "DEBUG"</code>) showed the smoking gun directly:</p>
+<pre><code>DEBUG: parent dir contents: ['Icons', '__init__.py', 'function.json']
+</code></pre>
+<p>Capital "I" — folder name mismatch, immediately obvious once visible.</p>
+<h3 id="the-fix">The fix</h3>
+<pre><code class="language-bash">cd /c/Projects/azure-resource-diff/snapshot_function
+mv Icons icons
+</code></pre>
+<p>Then redeploy (<code>func azure functionapp publish functionapp1-mtdiff4728 --python</code>). Confirmed working: the diagram's file size jumped from ~8.7 KB to ~28 KB after the fix (embedded base64 icon images are significantly larger than simple SVG shapes) — a reliable quick indicator the fix took effect, in addition to visually confirming the real icons in the output.</p>
+<h3 id="lesson-for-the-future">Lesson for the future</h3>
+<p><strong>On Windows, folder/file names can silently differ in case from what the code expects, with zero local symptoms</strong> — this will only surface once deployed to a Linux-based Function App. When creating any folder the deployed code will reference by exact name, double-check the case matches precisely, or better, confirm with <code>ls</code> immediately after creation rather than assuming.</p>
+<h3 id="the-debug-logging-is-still-in-the-code">The debug logging is still in the code</h3>
+<p>It's harmless to leave in (just extra log lines each run) but can be removed from <code>main()</code> in <code>snapshot_function/__init__.py</code> (search for <code># --- TEMPORARY DEBUG</code> through <code># --- END TEMPORARY DEBUG ---</code>) if you want cleaner logs going forward.</p>
+<hr />
+<h2 id="part-n-whats-automatic-vs-what-youd-only-touch-again">Part N — What's automatic vs. what you'd only touch again</h2>
+<table>
+<thead>
+<tr>
+<th>Action</th>
+<th>Frequency</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Part A (Steps 1-11)</td>
+<td><strong>Once</strong>, already done</td>
+</tr>
+<tr>
+<td>Redeploy code (<code>func azure functionapp publish</code>)</td>
+<td>Only if the Python code changes</td>
+</tr>
+<tr>
+<td>Update app settings (Part A Step 6/7)</td>
+<td>Only if the storage key rotates or config changes</td>
+</tr>
+<tr>
+<td>Query → snapshot → diff → diagram → upload</td>
+<td><strong>Every day at 6:00 PM SGT, automatically, forever</strong></td>
+</tr>
+</tbody>
+</table>
+<p>From here, your only ongoing task is checking the <code>diagrams</code> container whenever you want to see the latest result.</p>
+</body>
+</html>

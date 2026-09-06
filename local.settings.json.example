@@ -1,0 +1,12 @@
+{
+  "IsEncrypted": false,
+  "Values": {
+    "AzureWebJobsStorage": "UseDevelopmentStorage=true",
+    "FUNCTIONS_WORKER_RUNTIME": "python",
+    "STORAGE_CONNECTION_STRING": "<your-storage-account-connection-string>",
+    "CONTAINER_SNAPSHOTS": "snapshots",
+    "CONTAINER_DIFFS": "diffs",
+    "CONTAINER_DIAGRAMS": "diagrams",
+    "SUBSCRIPTION_IDS": "<sub-id-1>,<sub-id-2>"
+  }
+}

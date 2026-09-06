@@ -1,0 +1,187 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>Deployment Guide — Azure Resource Diff Tool (Read-Only)</title>
+<style>
+  body {
+    font-family: -apple-system, Segoe UI, Arial, sans-serif;
+    max-width: 900px;
+    margin: 40px auto;
+    padding: 0 20px;
+    line-height: 1.6;
+    color: #1f2328;
+  }
+  h1, h2, h3 { color: #0969da; border-bottom: 1px solid #d0d7de; padding-bottom: 6px; }
+  code {
+    background: #f6f8fa;
+    padding: 2px 6px;
+    border-radius: 4px;
+    font-family: Consolas, monospace;
+    font-size: 0.9em;
+  }
+  pre {
+    background: #f6f8fa;
+    padding: 14px;
+    border-radius: 8px;
+    overflow-x: auto;
+    border: 1px solid #d0d7de;
+  }
+  pre code { background: none; padding: 0; }
+  table { border-collapse: collapse; width: 100%; margin: 16px 0; }
+  th, td { border: 1px solid #d0d7de; padding: 8px 12px; text-align: left; }
+  th { background: #f6f8fa; }
+  blockquote { border-left: 4px solid #d0d7de; margin: 0; padding-left: 16px; color: #57606a; }
+</style>
+</head>
+<body>
+<h1 id="deployment-guide-steps-and-script-explanations">Deployment Guide — Steps and Script Explanations</h1>
+<p>This document explains <strong>what</strong> each step does, <strong>why</strong> it's necessary, and <strong>what every file in this project actually does</strong>. It reflects the current, production-safe version: <strong>read-only against your Azure resources</strong>, writing only to a storage account you already own.</p>
+<hr />
+<h2 id="part-1-scope-and-design-principle">Part 1 — Scope and design principle</h2>
+<p>This tool follows one hard rule: <strong>it never creates, modifies, or deletes an Azure resource other than blobs inside containers you already created.</strong></p>
+<pre><code>Resource Graph query   →  READ ONLY  (Reader role, nothing more)
+Diff + diagram logic   →  in-memory, no Azure calls at all
+Blob upload             →  WRITE, but only to containers you pre-created
+</code></pre>
+<p>There is intentionally <strong>no Terraform, no <code>az group create</code>, no <code>az storage account create</code>, and no auto-creation of blob containers</strong> anywhere in this codebase. If a container you specified doesn't exist, the script fails with a clear error instead of creating one — this is deliberate, not a bug.</p>
+<p>The one piece of infrastructure this <em>does</em> eventually need — if you choose to automate it — is the <strong>Function App itself</strong> (the compute shell that runs the code on a timer). That is still something you or your platform team provisions once, outside this codebase, using whatever process your organization already uses for infrastructure changes.</p>
+<hr />
+<h2 id="part-2-step-by-step-local-test-run">Part 2 — Step-by-step: local test run</h2>
+<h3 id="step-1-create-the-storage-containers-yourself-one-time-manual">Step 1: Create the storage containers yourself (one-time, manual)</h3>
+<pre><code class="language-bash">az storage container create --name snapshots --account-name &lt;your-storage-account&gt;
+az storage container create --name diffs --account-name &lt;your-storage-account&gt;
+az storage container create --name diagrams --account-name &lt;your-storage-account&gt;
+</code></pre>
+<p><strong>Why:</strong> The script deliberately does not do this for you — see Part 1. This is the only "creation" step in the entire workflow, and it's run by you directly against your own storage account, not embedded in any script.</p>
+<h3 id="step-2-set-up-python-locally">Step 2: Set up Python locally</h3>
+<pre><code class="language-bash">python -m venv .venv
+source .venv/Scripts/activate
+pip install -r requirements.txt
+</code></pre>
+<p><strong>Why:</strong> Isolates this project's dependencies from anything else on your machine.</p>
+<h3 id="step-3-export-configuration-as-environment-variables">Step 3: Export configuration as environment variables</h3>
+<pre><code class="language-bash">export STORAGE_CONNECTION_STRING=&quot;&lt;your connection string&gt;&quot;
+export SUBSCRIPTION_IDS=&quot;&lt;your subscription id&gt;&quot;
+export CONTAINER_SNAPSHOTS=&quot;snapshots&quot;
+export CONTAINER_DIFFS=&quot;diffs&quot;
+export CONTAINER_DIAGRAMS=&quot;diagrams&quot;
+</code></pre>
+<p><strong>Why:</strong> <code>run_local.py</code> bypasses the Azure Functions runtime entirely, so it reads real shell environment variables — not <code>local.settings.json</code> (that file is only auto-loaded by the Functions host, a separate execution path used later for automation).</p>
+<h3 id="step-4-run-it">Step 4: Run it</h3>
+<pre><code class="language-bash">python run_local.py
+</code></pre>
+<p><strong>What happens:</strong> Queries Resource Graph (read-only) → saves today's snapshot → loads yesterday's snapshot if present → diffs them → builds the dependency diagram + 3-column table → uploads results to your storage account.</p>
+<hr />
+<h2 id="part-3-every-script-explained">Part 3 — Every script, explained</h2>
+<h3 id="snapshot_function__init__py-the-core-logic"><code>snapshot_function/__init__.py</code> — the core logic</h3>
+<p><strong><code>RESOURCE_GRAPH_QUERY</code></strong>
+Selects <code>id, name, type, resourceGroup, location, subscriptionId, tags, kind, sku, properties</code> from every resource. <code>properties</code> is included specifically so the diagram code can read a VM's attached NIC/disk, and a NIC's subnet/public IP/NSG — plain metadata alone doesn't reveal relationships, only each resource's own attributes.</p>
+<p><strong><code>get_resource_graph_client()</code> / <code>get_blob_service_client()</code></strong>
+Both use <code>DefaultAzureCredential()</code>, which automatically resolves to your <code>az login</code> session locally, or a managed identity if this later runs inside a Function App — same code, no changes needed between the two environments, and no secrets ever hardcoded.</p>
+<p><strong><code>get_container()</code></strong>
+Read-only-safe by design: checks a container exists and returns a client for it. <strong>Does not create anything.</strong> Raises a clear <code>RuntimeError</code> naming the missing container if it isn't found, rather than silently creating one — this is the guardrail that keeps the whole tool from ever provisioning storage infrastructure on its own.</p>
+<p><strong><code>query_all_resources()</code></strong>
+Runs the KQL query, paging through results 1,000 rows at a time via Resource Graph's <code>skip_token</code> mechanism, since a subscription can have more resources than one response holds.</p>
+<p><strong><code>save_snapshot()</code> / <code>load_snapshot()</code></strong>
+Write/read the daily inventory as a dated JSON blob (<code>2026-09-03.json</code>). Every day's snapshot is kept (not just the latest), giving a full historical trail.</p>
+<p><strong><code>diff_snapshots()</code></strong>
+Pure set comparison, matched by Azure's <code>id</code> (globally unique, unlike <code>name</code> which can repeat across resource groups). Added = new IDs, Removed = missing IDs, Modified = same ID but changed <code>location</code>/<code>tags</code>/<code>sku</code>/<code>kind</code>/<code>resourceGroup</code>.</p>
+<p><strong><code>save_diff_report()</code></strong>
+Writes the diff as both <code>.json</code> (machine-readable) and <code>.md</code> (human-readable) so it can be consumed by tooling or just opened and read directly.</p>
+<p><strong><code>_extract_edges()</code></strong>
+Parses each resource's raw <code>properties</code> for known reference patterns to detect real relationships:
+- VM → its NIC (<code>networkProfile.networkInterfaces[].id</code>)
+- VM → its OS disk (<code>storageProfile.osDisk.managedDisk.id</code>)
+- NIC → its VNet (derived from <code>ipConfigurations[].properties.subnet.id</code>)
+- NIC → its Public IP and NSG</p>
+<p>This is what lets the diagram show actual dependency arrows (matching Azure's own Resource Visualizer style) instead of just an unconnected list of boxes.</p>
+<p><strong><code>generate_diagram_svg()</code></strong>
+Builds the visual output in two parts, as one SVG file:
+1. <strong>Dependency graph</strong> — resources laid out in tiers by relationship depth, connected by arrows, color-coded by change status (green border=added, red=removed, amber=modified), with a colored icon per resource type (VM, NIC, VNet, NSG, etc.)
+2. <strong>3-column table</strong> beneath the graph:
+   - <strong>Current Network Resources</strong> — every <code>Microsoft.Network/*</code> resource that exists today, listed alphabetically, regardless of change status
+   - <strong>Newly Added</strong> — every resource (any type) present today but not in yesterday's snapshot
+   - <strong>Newly Deleted</strong> — every resource (any type) present yesterday but missing today</p>
+<p><em>(Note: "Current Network Resources" is filtered to network resource types specifically, per your request; the Added/Deleted columns cover all resource types, not just network ones — flag if you'd rather those be network-filtered too.)</em></p>
+<p><strong><code>save_diagram()</code></strong>
+Uploads the finished SVG with <code>image/svg+xml</code> content type, so it renders correctly if opened directly in a browser.</p>
+<p><strong><code>main(mytimer)</code></strong>
+The entry point Azure Functions calls on schedule. Ties every step together: query → snapshot → diff → diagram → upload, then logs a one-line summary (<code>+X / -X / ~X</code>).</p>
+<h3 id="run_localpy"><code>run_local.py</code></h3>
+<p>Imports the same functions above and calls them directly, without the Azure Functions runtime. This is what you use for manual/local testing — same underlying logic as the scheduled version, just triggered by you instead of a timer.</p>
+<h3 id="snapshot_functionfunctionjson"><code>snapshot_function/function.json</code></h3>
+<pre><code class="language-json">&quot;schedule&quot;: &quot;0 0 10 * * *&quot;
+</code></pre>
+<p>6-field NCRONTAB (<code>second minute hour day month day-of-week</code>). <code>10:00 UTC</code> = <strong>6:00 PM Singapore Time</strong>. This only takes effect once the code is deployed into an actual Function App (see Part 4) — it has no effect when running via <code>run_local.py</code>.</p>
+<h3 id="hostjson"><code>host.json</code></h3>
+<p>App-wide Azure Functions host configuration (logging, extension bundle version). Only relevant once deployed to a Function App; unused by <code>run_local.py</code>.</p>
+<h3 id="requirementstxt"><code>requirements.txt</code></h3>
+<p>Python dependencies: <code>azure-functions</code>, <code>azure-identity</code>, <code>azure-mgmt-resourcegraph</code>, <code>azure-storage-blob</code>. Read by both <code>pip install -r requirements.txt</code> (local) and the Function App's deployment process (remote).</p>
+<h3 id="localsettingsjsonexample"><code>local.settings.json.example</code></h3>
+<p>Template for the Azure Functions host's local settings — only auto-read if you run this via <code>func start</code> (not used in our testing, which used <code>run_local.py</code> + exported env vars instead).</p>
+<hr />
+<h2 id="part-4-automating-it-one-time-setup-outside-this-codebase">Part 4 — Automating it (one-time setup, outside this codebase)</h2>
+<p>To have this run daily at 6pm SGT without manual triggering, a Function App must exist first. This is infrastructure creation — deliberately <strong>not</strong> part of this script — so it's a manual, one-time setup:</p>
+<h3 id="step-1-create-the-function-app-shell">Step 1: Create the Function App shell</h3>
+<pre><code class="language-bash">az group create --name rg-resource-diff-automation --location southeastasia
+az storage account create --name &lt;func-hosting-storage&gt; --resource-group rg-resource-diff-automation --location southeastasia --sku Standard_LRS
+az functionapp create --name &lt;your-function-app-name&gt; --resource-group rg-resource-diff-automation \
+  --storage-account &lt;func-hosting-storage&gt; --consumption-plan-location southeastasia \
+  --runtime python --runtime-version 3.11 --functions-version 4 --os-type Linux
+</code></pre>
+<p><strong>Why a separate storage account here:</strong> this one is the Function App's own internal requirement (Azure Functions needs storage to manage its own state) — it is <em>not</em> the same storage account you're saving diagrams to. Keeping them separate avoids any confusion about what the tool reads/writes versus what Azure's runtime needs to operate.</p>
+<h3 id="step-2-grant-minimal-permissions">Step 2: Grant minimal permissions</h3>
+<pre><code class="language-bash">az functionapp identity assign --name &lt;your-function-app-name&gt; --resource-group rg-resource-diff-automation
+PRINCIPAL_ID=$(az functionapp identity show --name &lt;your-function-app-name&gt; --resource-group rg-resource-diff-automation --query principalId -o tsv)
+
+az role assignment create --assignee &quot;$PRINCIPAL_ID&quot; --role &quot;Reader&quot; --scope &quot;/subscriptions/&lt;production-subscription-id&gt;&quot;
+
+STORAGE_ID=$(az storage account show --name &lt;your-diagram-storage-account&gt; --resource-group &lt;its-rg&gt; --query id -o tsv)
+az role assignment create --assignee &quot;$PRINCIPAL_ID&quot; --role &quot;Storage Blob Data Contributor&quot; --scope &quot;$STORAGE_ID&quot;
+</code></pre>
+<p><strong>Why <code>Reader</code> only:</strong> it's the minimum permission Resource Graph queries need — no write/modify access to production resources is ever granted.
+<strong>Why scope the storage role to the storage account ID, not the subscription:</strong> limits write access to exactly the one account this tool needs, nothing broader.</p>
+<h3 id="step-3-point-it-at-your-storage-account">Step 3: Point it at your storage account</h3>
+<pre><code class="language-bash">az functionapp config appsettings set --name &lt;your-function-app-name&gt; --resource-group rg-resource-diff-automation \
+  --settings STORAGE_CONNECTION_STRING=&quot;&lt;your diagram storage connection string&gt;&quot; \
+             CONTAINER_SNAPSHOTS=&quot;snapshots&quot; CONTAINER_DIFFS=&quot;diffs&quot; CONTAINER_DIAGRAMS=&quot;diagrams&quot; \
+             SUBSCRIPTION_IDS=&quot;&lt;production-subscription-id&gt;&quot;
+</code></pre>
+<h3 id="step-4-deploy-the-code">Step 4: Deploy the code</h3>
+<pre><code class="language-bash">func azure functionapp publish &lt;your-function-app-name&gt; --python
+</code></pre>
+<p>This pushes the code into the already-created Function App and installs its Python dependencies remotely — a separate action from provisioning, since Terraform/CLI has no concept of "your application logic."</p>
+<h3 id="from-here-on">From here on</h3>
+<p>Azure's Functions host wakes the code on the 10:00 UTC (6pm SGT) timer, runs it, uploads the diagram, and goes back to sleep — no manual triggering, no laptop needing to be on.</p>
+<hr />
+<h2 id="part-5-what-runs-automatically-vs-what-you-do-once">Part 5 — What runs automatically vs. what you do once</h2>
+<table>
+<thead>
+<tr>
+<th>Action</th>
+<th>Frequency</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Create storage containers</td>
+<td>Once</td>
+</tr>
+<tr>
+<td>Create the Function App shell + grant permissions</td>
+<td>Once</td>
+</tr>
+<tr>
+<td><code>func azure functionapp publish</code></td>
+<td>Once (or whenever code changes)</td>
+</tr>
+<tr>
+<td>Query → snapshot → diff → diagram → upload</td>
+<td>Every day at 6pm SGT, automatically, forever</td>
+</tr>
+</tbody>
+</table>
+<p>From here, your only ongoing task is checking the <code>diagrams/</code> container whenever you want to see the latest result.</p>
+</body>
+</html>
