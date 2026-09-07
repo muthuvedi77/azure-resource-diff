@@ -1,0 +1,137 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>Slack Notification Setup — Azure Resource Diff Tool</title>
+<style>
+  body { font-family: -apple-system, Segoe UI, Arial, sans-serif; max-width: 900px; margin: 40px auto; padding: 0 20px; line-height: 1.6; color: #1f2328; }
+  h1, h2, h3 { color: #0969da; border-bottom: 1px solid #d0d7de; padding-bottom: 6px; }
+  code { background: #f6f8fa; padding: 2px 6px; border-radius: 4px; font-family: Consolas, monospace; font-size: 0.9em; }
+  pre { background: #f6f8fa; padding: 14px; border-radius: 8px; overflow-x: auto; border: 1px solid #d0d7de; }
+  pre code { background: none; padding: 0; }
+  table { border-collapse: collapse; width: 100%; margin: 16px 0; }
+  th, td { border: 1px solid #d0d7de; padding: 8px 12px; text-align: left; }
+  th { background: #f6f8fa; }
+  strong { color: #24292f; }
+</style>
+</head>
+<body>
+<h1 id="slack-notification-setup-azure-resource-diff-tool">Slack Notification Setup — Azure Resource Diff Tool</h1>
+<p><strong>Purpose:</strong> step-by-step procedure to enable Slack notifications for this tool in a <strong>new</strong> environment (different Function App, different Slack workspace, etc.). This is a one-time setup per environment.</p>
+<p><strong>What this feature does:</strong> after each run, if any resources were added, removed, or modified, a message is posted to a Slack channel with the change counts, resource names, and buttons linking to the diagram and full diff report. If nothing changed that day, <strong>no message is sent</strong> — no daily noise. If <code>SLACK_WEBHOOK_URL</code> isn't configured at all, this feature is silently skipped entirely — nothing else breaks.</p>
+<hr />
+<h2 id="part-1-create-a-slack-incoming-webhook">Part 1 — Create a Slack Incoming Webhook</h2>
+<p>Works with any Slack account type (personal or organizational) — no special licensing required, unlike Microsoft Teams' Workflows/Power Automate route, which requires an organizational Microsoft 365 account.</p>
+<ol>
+<li>Open a browser and go to <strong>https://api.slack.com/apps</strong>
+   <em>(Note: this is a different site from <code>app.slack.com</code>, which is the Slack chat interface itself — the app/webhook creation happens only on <code>api.slack.com</code>.)</em></li>
+<li>Sign in with your Slack account if prompted</li>
+<li>Click <strong>Create New App</strong> (top right)</li>
+<li>Choose <strong>Blank app</strong> (simplest option — no extra features needed)</li>
+<li>Select the <strong>workspace</strong> you want notifications sent to</li>
+<li>Enter an <strong>App Name</strong> (e.g. <code>Azure Resource Diff Alerts</code>)</li>
+<li>Click <strong>Create App</strong></li>
+<li>In the left sidebar of the app's settings page, click <strong>Incoming Webhooks</strong></li>
+<li>Toggle <strong>Activate Incoming Webhooks</strong> to <strong>On</strong></li>
+<li>Click <strong>Add New Webhook to Workspace</strong> (appears after activating)</li>
+<li>In the channel picker, select the channel you want alerts posted to</li>
+<li>Click <strong>Allow</strong></li>
+<li>Copy the <strong>Webhook URL</strong> now shown in the table (starts with <code>https://hooks.slack.com/services/...</code>)</li>
+</ol>
+<p><strong>Keep this URL safe</strong> — anyone with it can post messages to your channel. Treat it like a credential (don't commit it to code, don't share it in chat/tickets).</p>
+<hr />
+<h2 id="part-2-add-the-webhook-url-to-the-function-app">Part 2 — Add the webhook URL to the Function App</h2>
+<pre><code class="language-bash">az functionapp config appsettings set \
+  --name &lt;your-function-app-name&gt; \
+  --resource-group &lt;your-resource-group&gt; \
+  --settings SLACK_WEBHOOK_URL=&quot;&lt;paste your Slack webhook URL here&gt;&quot;
+</code></pre>
+<p><strong>Verify it saved correctly:</strong></p>
+<pre><code class="language-bash">az functionapp config appsettings list \
+  --name &lt;your-function-app-name&gt; \
+  --resource-group &lt;your-resource-group&gt; \
+  --query &quot;[?name=='SLACK_WEBHOOK_URL'].value&quot; -o tsv
+</code></pre>
+<p>Should print your webhook URL back.</p>
+<hr />
+<h2 id="part-3-confirm-the-code-supports-slack-notifications">Part 3 — Confirm the code supports Slack notifications</h2>
+<p>The Slack notification logic lives in <code>snapshot_function/__init__.py</code>. Confirm it's present:</p>
+<pre><code class="language-bash">grep -c &quot;send_slack_notification&quot; snapshot_function/__init__.py
+</code></pre>
+<p>Should show <code>2</code> or higher (the function definition, plus the call inside <code>main()</code>).</p>
+<p>If it shows <code>0</code>, this environment's code doesn't have the feature yet — copy the current <code>snapshot_function/__init__.py</code> and <code>run_local.py</code> from the reference project into this environment before continuing.</p>
+<hr />
+<h2 id="part-4-deploy">Part 4 — Deploy</h2>
+<pre><code class="language-bash">cd &lt;your-project-folder&gt;
+func azure functionapp publish &lt;your-function-app-name&gt; --python
+</code></pre>
+<p>Confirm it ends with <code>Remote build succeeded!</code> and lists <code>snapshot_function - [timerTrigger]</code>.</p>
+<hr />
+<h2 id="part-5-test-with-a-real-change">Part 5 — Test with a real change</h2>
+<p>Since notifications only fire when something actually changed, create a small, disposable test resource:</p>
+<pre><code class="language-bash">az group create --name demo-slack-test --location &lt;your-region&gt;
+
+az network vnet create \
+  --name demo-slack-vnet \
+  --resource-group demo-slack-test \
+  --location &lt;your-region&gt; \
+  --address-prefix 10.60.0.0/16 \
+  --subnet-name demo-subnet \
+  --subnet-prefix 10.60.1.0/24
+</code></pre>
+<p>Wait ~30-60 seconds for Resource Graph to index it.</p>
+<p><strong>Trigger the function:</strong></p>
+<pre><code class="language-bash">MASTER_KEY=$(az functionapp keys list --name &lt;your-function-app-name&gt; --resource-group &lt;your-resource-group&gt; --query masterKey -o tsv)
+
+curl -X POST &quot;https://&lt;your-function-app-name&gt;.azurewebsites.net/admin/functions/snapshot_function?code=$MASTER_KEY&quot; \
+  -H &quot;Content-Type: application/json&quot; -d '{}'
+
+sleep 20
+</code></pre>
+<p><strong>Check Slack</strong> — the channel selected in Part 1, Step 11 should show a new message with:
+- 🟢 (or 🔴 if something was removed) header: "Azure Resource Changes — [date]"
+- Added / Removed / Modified counts
+- The test VNet listed under "Added resources"
+- <strong>View Diagram</strong> and <strong>View Full Diff Report</strong> buttons (clicking them opens a time-limited, secure link — see Part 6)</p>
+<p><strong>Clean up the test resource:</strong></p>
+<pre><code class="language-bash">az group delete --name demo-slack-test --yes --no-wait
+</code></pre>
+<hr />
+<h2 id="part-6-how-the-diagramdiff-links-work-background-not-a-setup-step">Part 6 — How the diagram/diff links work (background, not a setup step)</h2>
+<p>The buttons in the Slack message use a <strong>SAS (Shared Access Signature) URL</strong> — a time-limited, read-only link generated fresh for each notification, valid for 7 days by default. This keeps the underlying storage containers private while still letting anyone with the link view that specific file, without needing an Azure login or any broader storage access.</p>
+<p>If a link stops working after 7 days, that's expected — the next day's notification (if there's a change) will include a fresh link.</p>
+<hr />
+<h2 id="troubleshooting">Troubleshooting</h2>
+<table>
+<thead>
+<tr>
+<th>Symptom</th>
+<th>Likely cause</th>
+<th>Fix</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>No Slack message appears, even after a real change</td>
+<td><code>SLACK_WEBHOOK_URL</code> not set, or set incorrectly</td>
+<td>Re-check Part 2's verification step</td>
+</tr>
+<tr>
+<td>No Slack message, but no error in logs either</td>
+<td>This is expected if nothing actually changed that day — the feature intentionally stays silent on no-change days</td>
+<td>Not a bug — create a real test change (Part 5) to verify</td>
+</tr>
+<tr>
+<td>Slack message appears but buttons give an error/expired link</td>
+<td>More than 7 days have passed since that specific notification</td>
+<td>Expected — links expire; check the storage account directly for current files instead</td>
+</tr>
+<tr>
+<td><code>grep -c "send_slack_notification"</code> returns <code>0</code></td>
+<td>This environment's code predates the Slack feature</td>
+<td>Copy the latest <code>snapshot_function/__init__.py</code> / <code>run_local.py</code> from the reference project</td>
+</tr>
+</tbody>
+</table>
+</body>
+</html>

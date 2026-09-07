@@ -19,11 +19,12 @@ import logging
 import base64
 import datetime as dt
 
+import requests
 import azure.functions as func
 from azure.identity import DefaultAzureCredential
 from azure.mgmt.resourcegraph import ResourceGraphClient
 from azure.mgmt.resourcegraph.models import QueryRequest
-from azure.storage.blob import BlobServiceClient
+from azure.storage.blob import BlobServiceClient, generate_blob_sas, BlobSasPermissions
 
 # --------------------------------------------------------------------------
 # Configuration (all via Function App settings / environment variables)
@@ -32,6 +33,10 @@ STORAGE_CONNECTION_STRING = os.environ["STORAGE_CONNECTION_STRING"]
 CONTAINER_SNAPSHOTS = os.environ.get("CONTAINER_SNAPSHOTS", "snapshots")
 CONTAINER_DIFFS = os.environ.get("CONTAINER_DIFFS", "diffs")
 CONTAINER_DIAGRAMS = os.environ.get("CONTAINER_DIAGRAMS", "diagrams")
+
+# Optional: Slack Incoming Webhook URL. If not set, Slack notifications are
+# simply skipped — everything else still works normally.
+SLACK_WEBHOOK_URL = os.environ.get("SLACK_WEBHOOK_URL", "").strip()
 
 # Comma-separated list of subscription IDs to scan. Leave blank to let
 # Resource Graph use every subscription the identity can see.
@@ -682,6 +687,116 @@ def cleanup_old_blobs(container, keep: int = 2, suffix: str = "") -> None:
         logging.info("Retention cleanup: deleted old blob %s", name)
 
 
+def _parse_connection_string(conn_str: str) -> dict:
+    """Parses a storage connection string into its key=value parts."""
+    parts = {}
+    for segment in conn_str.split(";"):
+        if "=" in segment:
+            key, _, value = segment.partition("=")
+            parts[key] = value
+    return parts
+
+
+def generate_sas_url(container_name: str, blob_name: str, expiry_hours: int = 168) -> str:
+    """
+    Generates a time-limited, read-only SAS URL for a blob, so it can be
+    viewed directly (e.g. opened in a browser from a Teams message) without
+    granting broader storage access. Defaults to a 7-day expiry.
+    """
+    conn = _parse_connection_string(STORAGE_CONNECTION_STRING)
+    account_name = conn.get("AccountName")
+    account_key = conn.get("AccountKey")
+
+    sas_token = generate_blob_sas(
+        account_name=account_name,
+        container_name=container_name,
+        blob_name=blob_name,
+        account_key=account_key,
+        permission=BlobSasPermissions(read=True),
+        expiry=dt.datetime.utcnow() + dt.timedelta(hours=expiry_hours),
+    )
+    return f"https://{account_name}.blob.core.windows.net/{container_name}/{blob_name}?{sas_token}"
+
+
+def send_slack_notification(diff: dict, date_str: str, diagram_url: str, diff_report_url: str) -> None:
+    """
+    Posts a summary message to a Slack channel via an Incoming Webhook, with
+    links to view the diagram and the full diff report. Silently does
+    nothing if SLACK_WEBHOOK_URL isn't configured — this feature is entirely
+    optional and never blocks the rest of the run.
+    """
+    if not SLACK_WEBHOOK_URL:
+        return
+
+    added = diff["added"]
+    removed = diff["removed"]
+    modified = diff["modified"]
+
+    def _list_names(items, limit=10):
+        names = [i.get("name", "?") for i in items[:limit]]
+        text = ", ".join(names)
+        if len(items) > limit:
+            text += f", and {len(items) - limit} more"
+        return text or "_(none)_"
+
+    emoji = "🔴" if removed else "🟢"
+
+    blocks = [
+        {
+            "type": "header",
+            "text": {"type": "plain_text", "text": f"{emoji} Azure Resource Changes — {date_str}"},
+        },
+        {
+            "type": "section",
+            "fields": [
+                {"type": "mrkdwn", "text": f"*Added:*\n{len(added)}"},
+                {"type": "mrkdwn", "text": f"*Removed:*\n{len(removed)}"},
+                {"type": "mrkdwn", "text": f"*Modified:*\n{len(modified)}"},
+            ],
+        },
+    ]
+
+    if added:
+        blocks.append({"type": "section", "text": {"type": "mrkdwn",
+                       "text": f"*Added resources:*\n{_list_names(added)}"}})
+    if removed:
+        blocks.append({"type": "section", "text": {"type": "mrkdwn",
+                       "text": f"*Removed resources:*\n{_list_names(removed)}"}})
+    if modified:
+        blocks.append({"type": "section", "text": {"type": "mrkdwn",
+                       "text": f"*Modified resources:*\n{_list_names(modified)}"}})
+
+    blocks.append({
+        "type": "actions",
+        "elements": [
+            {
+                "type": "button",
+                "text": {"type": "plain_text", "text": "View Diagram"},
+                "url": diagram_url,
+                "style": "primary",
+            },
+            {
+                "type": "button",
+                "text": {"type": "plain_text", "text": "View Full Diff Report"},
+                "url": diff_report_url,
+            },
+        ],
+    })
+
+    payload = {
+        "text": f"Azure Resource Changes — {date_str} (+{len(added)} / -{len(removed)} / ~{len(modified)})",
+        "blocks": blocks,
+    }
+
+    try:
+        response = requests.post(SLACK_WEBHOOK_URL, json=payload, timeout=15)
+        response.raise_for_status()
+        logging.info("Slack notification sent successfully.")
+    except requests.exceptions.RequestException as e:
+        # Never let a notification failure break the actual data pipeline.
+        logging.warning("Failed to send Slack notification: %s", e)
+
+
 # --------------------------------------------------------------------------
 # Entry point
 # --------------------------------------------------------------------------
@@ -733,6 +848,18 @@ def main(mytimer: func.TimerRequest) -> None:
     # Retention: keep only the 2 most recent diagrams (today + yesterday)
     # so the container never grows past what's needed for manual comparison.
     cleanup_old_blobs(diagram_container, keep=2, suffix="-diagram.svg")
+
+    # Notify Slack only if something actually changed today — no noise on
+    # unchanged days. Silently skipped entirely if SLACK_WEBHOOK_URL isn't set.
+    total_changes = (
+        diff["summary"]["added_count"]
+        + diff["summary"]["removed_count"]
+        + diff["summary"]["modified_count"]
+    )
+    if total_changes > 0 and SLACK_WEBHOOK_URL:
+        diagram_url = generate_sas_url(CONTAINER_DIAGRAMS, f"{today_str}-diagram.svg")
+        diff_report_url = generate_sas_url(CONTAINER_DIFFS, f"{today_str}-diff.md")
+        send_slack_notification(diff, today_str, diagram_url, diff_report_url)
 
     logging.info(
         "Run complete: +%d / -%d / ~%d",

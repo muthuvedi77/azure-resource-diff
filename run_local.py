@@ -28,9 +28,12 @@ from snapshot_function import (  # noqa: E402
     generate_diagram_svg,
     save_diagram,
     cleanup_old_blobs,
+    generate_sas_url,
+    send_slack_notification,
     CONTAINER_SNAPSHOTS,
     CONTAINER_DIFFS,
     CONTAINER_DIAGRAMS,
+    SLACK_WEBHOOK_URL,
 )
 import datetime as dt
 import logging
@@ -65,6 +68,16 @@ def main():
 
     # Retention: keep only the 2 most recent diagrams (today + yesterday)
     cleanup_old_blobs(diagram_container, keep=2, suffix="-diagram.svg")
+
+    total_changes = (
+        diff["summary"]["added_count"]
+        + diff["summary"]["removed_count"]
+        + diff["summary"]["modified_count"]
+    )
+    if total_changes > 0 and SLACK_WEBHOOK_URL:
+        diagram_url = generate_sas_url(CONTAINER_DIAGRAMS, f"{today_str}-diagram.svg")
+        diff_report_url = generate_sas_url(CONTAINER_DIFFS, f"{today_str}-diff.md")
+        send_slack_notification(diff, today_str, diagram_url, diff_report_url)
 
     print(f"Done. +{diff['summary']['added_count']} / "
           f"-{diff['summary']['removed_count']} / "
