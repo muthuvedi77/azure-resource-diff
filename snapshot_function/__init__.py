@@ -24,6 +24,7 @@ import azure.functions as func
 from azure.identity import DefaultAzureCredential
 from azure.mgmt.resourcegraph import ResourceGraphClient
 from azure.mgmt.resourcegraph.models import QueryRequest
+from azure.mgmt.monitor import MonitorManagementClient
 from azure.storage.blob import BlobServiceClient, generate_blob_sas, BlobSasPermissions
 
 # --------------------------------------------------------------------------
@@ -105,6 +106,74 @@ def query_all_resources(client: ResourceGraphClient) -> list[dict]:
     return all_rows
 
 
+def get_monitor_client(credential, subscription_id: str) -> MonitorManagementClient:
+    return MonitorManagementClient(credential, subscription_id)
+
+
+def get_change_actors(
+    monitor_client: MonitorManagementClient,
+    subscription_id: str,
+    start_time: dt.datetime,
+    end_time: dt.datetime,
+) -> dict[str, str]:
+    """
+    Queries the Azure Activity Log for Write and Delete operations within
+    the given time window, and returns a mapping of
+    {resource_id (lowercase): who_performed_it (email/UPN or app name)}.
+
+    Uses the most recent matching event per resource if there were several
+    in the window (e.g. a resource created then modified again same day).
+
+    Requires only the Reader role already granted to this identity —
+    Activity Log read access is included in Reader, no extra permission
+    needed.
+    """
+    actors: dict[str, str] = {}
+
+    filter_str = (
+        f"eventTimestamp ge '{start_time.isoformat()}' "
+        f"and eventTimestamp le '{end_time.isoformat()}'"
+    )
+
+    try:
+        events = monitor_client.activity_logs.list(
+            filter=filter_str,
+            select="resourceId,caller,operationName,eventTimestamp",
+        )
+        for event in events:
+            op_name = (event.operation_name.value or "").lower() if event.operation_name else ""
+            if not (op_name.endswith("/write") or op_name.endswith("/delete")):
+                continue
+            if not event.resource_id or not event.caller:
+                continue
+            # Keep the most recent event per resource; activity_logs.list
+            # generally returns newest-first, so the first match wins.
+            key = event.resource_id.lower()
+            if key not in actors:
+                actors[key] = event.caller
+    except Exception as e:
+        # Never let activity log lookup failures break the main pipeline —
+        # "who changed it" is a nice-to-have enrichment, not critical data.
+        logging.warning("Could not fetch Activity Log data: %s", e)
+
+    return actors
+
+
+def annotate_with_actors(diff: dict, actors: dict[str, str]) -> None:
+    """
+    Adds a 'changed_by' field to each added/removed/modified resource in
+    the diff, looked up from the actors map built by get_change_actors().
+    Defaults to 'Unknown' if no matching Activity Log event was found
+    (e.g. the log entry aged out, or the resource was changed by a process
+    without activity logging, which is rare but possible).
+    """
+    for bucket_key in ("added", "removed"):
+        for item in diff.get(bucket_key, []):
+            item["changed_by"] = actors.get(item["id"].lower(), "Unknown")
+    for item in diff.get("modified", []):
+        item["changed_by"] = actors.get(item["id"].lower(), "Unknown")
+
+
 # --------------------------------------------------------------------------
 # Step 2 — Save snapshot
 # --------------------------------------------------------------------------
@@ -182,16 +251,19 @@ def save_diff_report(container, date_str: str, diff: dict) -> str:
         "## Added Resources",
     ]
     for r in diff["added"]:
-        md_lines.append(f"- `{r['type']}` **{r['name']}** ({r.get('resourceGroup', '-')})")
+        who = r.get("changed_by", "Unknown")
+        md_lines.append(f"- `{r['type']}` **{r['name']}** ({r.get('resourceGroup', '-')}) — created by: {who}")
 
     md_lines.append("\n## Removed Resources")
     for r in diff["removed"]:
-        md_lines.append(f"- `{r['type']}` **{r['name']}** ({r.get('resourceGroup', '-')})")
+        who = r.get("changed_by", "Unknown")
+        md_lines.append(f"- `{r['type']}` **{r['name']}** ({r.get('resourceGroup', '-')}) — deleted by: {who}")
 
     md_lines.append("\n## Modified Resources")
     for r in diff["modified"]:
         changed_fields = ", ".join(r["changes"].keys())
-        md_lines.append(f"- **{r['name']}** — changed: {changed_fields}")
+        who = r.get("changed_by", "Unknown")
+        md_lines.append(f"- **{r['name']}** — changed: {changed_fields} — by: {who}")
 
     md_blob_name = f"{date_str}-diff.md"
     container.upload_blob(md_blob_name, "\n".join(md_lines), overwrite=True)
@@ -608,7 +680,7 @@ def generate_diagram_svg(diff: dict, today_resources: list[dict], date_str: str)
     )
 
     table_y = graph_height + 30
-    row_h = 20
+    row_h = 30
     col_w = graph_width / 3
 
     svg.append(f'<text x="{PAD}" y="{table_y}" font-size="14" font-weight="bold" '
@@ -641,6 +713,11 @@ def generate_diagram_svg(diff: dict, today_resources: list[dict], date_str: str)
                 svg.append(f'<text x="{x}" y="{ry}" font-size="10.5" fill="#1f2328">'
                            f'{esc(item.get("name",""))} '
                            f'<tspan fill="#57606a">({type_short})</tspan></text>')
+                # "Changed by" only applies to Added/Removed columns (index 1, 2) —
+                # the Current Network Resources column (index 0) has no actor data.
+                if col_idx in (1, 2):
+                    who = esc(item.get("changed_by", "Unknown"))
+                    svg.append(f'<text x="{x}" y="{ry+13}" font-size="9" fill="#8c959f">by {who}</text>')
 
     total_height = table_y + max_rows * row_h + 20
     total_width = max(graph_width, 700)
@@ -733,10 +810,10 @@ def send_slack_notification(diff: dict, date_str: str, diagram_url: str, diff_re
     modified = diff["modified"]
 
     def _list_names(items, limit=10):
-        names = [i.get("name", "?") for i in items[:limit]]
-        text = ", ".join(names)
+        entries = [f"{i.get('name', '?')} _(by {i.get('changed_by', 'Unknown')})_" for i in items[:limit]]
+        text = "\n".join(entries)
         if len(items) > limit:
-            text += f", and {len(items) - limit} more"
+            text += f"\n_and {len(items) - limit} more_"
         return text or "_(none)_"
 
     emoji = "🔴" if removed else "🟢"
@@ -840,6 +917,25 @@ def main(mytimer: func.TimerRequest) -> None:
         return
 
     diff = diff_snapshots(yesterday_resources, today_resources)
+
+    # Enrich the diff with "who made this change" from the Activity Log,
+    # covering the window since yesterday's run. Best-effort — if this
+    # fails for any reason, every resource just shows changed_by="Unknown"
+    # rather than breaking the run.
+    if SUBSCRIPTION_IDS:
+        try:
+            credential = DefaultAzureCredential()
+            monitor_client = get_monitor_client(credential, SUBSCRIPTION_IDS[0])
+            window_start = dt.datetime.combine(yesterday, dt.time.min)
+            window_end = dt.datetime.combine(today, dt.time.max)
+            actors = get_change_actors(monitor_client, SUBSCRIPTION_IDS[0], window_start, window_end)
+            annotate_with_actors(diff, actors)
+        except Exception as e:
+            logging.warning("Skipping change-actor lookup due to error: %s", e)
+            annotate_with_actors(diff, {})
+    else:
+        annotate_with_actors(diff, {})
+
     save_diff_report(diff_container, today_str, diff)
 
     svg = generate_diagram_svg(diff, today_resources, today_str)

@@ -1,5 +1,6 @@
 azure-functions
 azure-identity
 azure-mgmt-resourcegraph
+azure-mgmt-monitor
 azure-storage-blob
 requests
