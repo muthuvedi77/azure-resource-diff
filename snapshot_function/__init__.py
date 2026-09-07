@@ -204,8 +204,13 @@ def load_snapshot(container, date_str: str) -> list[dict] | None:
 # --------------------------------------------------------------------------
 
 def diff_snapshots(yesterday: list[dict], today: list[dict]) -> dict:
-    y_by_id = {r["id"]: r for r in yesterday}
-    t_by_id = {r["id"]: r for r in today}
+    # Azure resource IDs are case-insensitive, and Resource Graph doesn't
+    # always return the same casing for the resourceGroup segment between
+    # runs (e.g. "TERRAFORMTEST" one day, "terraformtest" the next) even
+    # when nothing actually changed. Matching by lowercased id keeps the
+    # same physical resource from showing up as both added and removed.
+    y_by_id = {r["id"].lower(): r for r in yesterday}
+    t_by_id = {r["id"].lower(): r for r in today}
 
     added_ids = t_by_id.keys() - y_by_id.keys()
     removed_ids = y_by_id.keys() - t_by_id.keys()
@@ -218,10 +223,16 @@ def diff_snapshots(yesterday: list[dict], today: list[dict]) -> dict:
         fields_to_check = ["location", "tags", "sku", "kind", "resourceGroup"]
         changes = {}
         for f in fields_to_check:
-            if before.get(f) != after.get(f):
-                changes[f] = {"before": before.get(f), "after": after.get(f)}
+            before_val, after_val = before.get(f), after.get(f)
+            # A pure casing difference in resourceGroup isn't a real change —
+            # see the case-insensitive id matching note above.
+            if (f == "resourceGroup" and isinstance(before_val, str) and isinstance(after_val, str)
+                    and before_val.lower() == after_val.lower()):
+                continue
+            if before_val != after_val:
+                changes[f] = {"before": before_val, "after": after_val}
         if changes:
-            modified.append({"id": rid, "name": after.get("name"), "changes": changes})
+            modified.append({"id": after["id"], "name": after.get("name"), "changes": changes})
 
     return {
         "added": [t_by_id[i] for i in added_ids],
@@ -461,12 +472,13 @@ def _load_icon_data_uri(rtype: str) -> str | None:
     return data_uri
 
 
-def _extract_edges(resources: list[dict]) -> list[tuple[str, str]]:
+def _extract_edges(resources: list[dict]) -> list[tuple[str, str, str]]:
     """
     Parse each resource's `properties` for references to other resources
     (VM -> NIC/Disk, NIC -> VNet/PublicIP/NSG) and return a list of
-    (source_id, target_id) edges. Best-effort: unknown/absent properties
-    are simply skipped, never raise.
+    (source_id, target_id, label) edges, where label is a short human
+    description of the relationship (e.g. "attached NIC", "subnet <name>").
+    Best-effort: unknown/absent properties are simply skipped, never raise.
     """
     edges = []
     by_id = {r["id"].lower(): r["id"] for r in resources if r.get("id")}
@@ -491,12 +503,12 @@ def _extract_edges(resources: list[dict]) -> list[tuple[str, str]]:
             for nic in (props.get("networkProfile", {}) or {}).get("networkInterfaces", []) or []:
                 target = resolve(nic.get("id"))
                 if target:
-                    edges.append((r["id"], target))
+                    edges.append((r["id"], target, "attached NIC"))
             disk = (((props.get("storageProfile", {}) or {}).get("osDisk", {}) or {})
                     .get("managedDisk", {}) or {}).get("id")
             target = resolve(disk)
             if target:
-                edges.append((r["id"], target))
+                edges.append((r["id"], target, "OS disk"))
 
         elif rtype == "microsoft.network/networkinterfaces":
             for ipconf in props.get("ipConfigurations", []) or []:
@@ -504,55 +516,374 @@ def _extract_edges(resources: list[dict]) -> list[tuple[str, str]]:
                 subnet_id = (ipprops.get("subnet", {}) or {}).get("id")
                 vnet_target = vnet_id_from_subnet_id(subnet_id)
                 if vnet_target:
-                    edges.append((r["id"], vnet_target))
+                    subnet_name = subnet_id.split("/subnets/")[-1] if subnet_id else "?"
+                    edges.append((r["id"], vnet_target, f"subnet {subnet_name}"))
                 pip_target = resolve((ipprops.get("publicIPAddress", {}) or {}).get("id"))
                 if pip_target:
-                    edges.append((r["id"], pip_target))
+                    edges.append((r["id"], pip_target, "public IP"))
             nsg_target = resolve((props.get("networkSecurityGroup", {}) or {}).get("id"))
             if nsg_target:
-                edges.append((r["id"], nsg_target))
+                edges.append((r["id"], nsg_target, "secured by"))
 
         elif rtype == "microsoft.web/sites":
             # App Service -> its App Service Plan
             plan_target = resolve(props.get("serverFarmId"))
             if plan_target:
-                edges.append((r["id"], plan_target))
-            # App Service -> its Application Insights component, via Azure's
-            # own "hidden-link:<resource-id>" tag convention (the same
-            # mechanism the Azure Portal itself uses to draw this link).
+                edges.append((r["id"], plan_target, "hosted on"))
+            # App Service -> its Application Insights component. Azure uses
+            # two different "hidden-link" tag conventions depending on the
+            # resource type: either the resource id lives in the tag KEY
+            # (value == "Resource"), or — as seen on Function Apps — the tag
+            # KEY is a fixed label ("hidden-link: /app-insights-resource-id")
+            # and the resource id is the tag VALUE. Check both so the edge
+            # doesn't silently go missing depending on which shape shows up.
             for tag_key, tag_val in (r.get("tags") or {}).items():
-                if tag_key.lower().startswith("hidden-link:") and tag_val == "Resource":
-                    linked_id = tag_key.split("hidden-link:", 1)[-1]
-                    target = resolve(linked_id)
-                    if target:
-                        edges.append((r["id"], target))
+                key_norm = tag_key.lower().replace(" ", "")
+                if not key_norm.startswith("hidden-link:"):
+                    continue
+                target = None
+                if tag_val == "Resource":
+                    target = resolve(tag_key.split("hidden-link:", 1)[-1])
+                elif isinstance(tag_val, str) and tag_val.lower().startswith("/subscriptions/"):
+                    target = resolve(tag_val)
+                if target:
+                    edges.append((r["id"], target, "monitored by"))
 
         elif rtype == "microsoft.insights/components":
             # Application Insights -> its backing Log Analytics Workspace
             workspace_target = resolve(props.get("WorkspaceResourceId"))
             if workspace_target:
-                edges.append((r["id"], workspace_target))
+                edges.append((r["id"], workspace_target, "logs to"))
 
     return edges
 
 
+GROUP_HEADER_BG = "#eef3f4"
+GROUP_BORDER = "#d7e0e5"
+MONO_FONT = "Consolas, 'Courier New', monospace"
+TEXT_MUTED = "#5d6f78"
+TEXT_FAINT = "#8a99a1"
+EDGE_COLOR = "#8fa0a8"
+ACCENT = "#1f6f73"
+ACCENT_SOFT = "#e2f0ef"
+
+CARD_W = 162
+GAP_X = 18
+TIER_GAP = 46
+PANEL_PAD = 18
+PANEL_HEADER_H = 40
+PANEL_GAP = 18
+BOARD_MAX_W = 1320
+TITLE_H = 30
+TABLE_ROW_H = 22
+
+
+def _node_extra_line(r: dict) -> str | None:
+    """
+    A short, type-specific detail line shown under a node's type caption —
+    e.g. a VNet's subnet CIDR, a VM's size, a disk's size/SKU. Returns None
+    when the resource type has no natural "one more useful fact" to show.
+    """
+    props = r.get("properties") or {}
+    rtype = (r.get("type") or "").lower()
+
+    if rtype == "microsoft.network/virtualnetworks":
+        subnets = props.get("subnets") or []
+        if subnets:
+            cidr = (subnets[0].get("properties") or {}).get("addressPrefix")
+            if cidr:
+                return cidr
+        space = (props.get("addressSpace") or {}).get("addressPrefixes") or []
+        return space[0] if space else None
+    if rtype == "microsoft.compute/virtualmachines":
+        return (props.get("hardwareProfile") or {}).get("vmSize")
+    if rtype == "microsoft.compute/disks":
+        size = props.get("diskSizeGB")
+        sku = (r.get("sku") or {}).get("name")
+        parts = ([f"{size} GB"] if size else []) + ([sku] if sku else [])
+        return " · ".join(parts) if parts else None
+    if rtype == "microsoft.storage/storageaccounts":
+        return (r.get("sku") or {}).get("name")
+    if rtype == "microsoft.web/serverfarms":
+        sku = (r.get("sku") or {}).get("name")
+        return f"SKU {sku}" if sku else None
+    if rtype == "microsoft.network/publicipaddresses":
+        parts = [p for p in [props.get("publicIPAllocationMethod"), props.get("ipAddress")] if p]
+        return " · ".join(parts) if parts else None
+    return None
+
+
+def _layout_group_tiers(node_ids: list[str], edges: list[tuple[str, str, str]]) -> list[list[str]]:
+    """
+    Depth-based tiering scoped to a single resource group's own nodes/edges,
+    so unrelated resource groups never end up sharing a row (the old
+    single-graph layout tiered ALL resources together, which is what made
+    it look cluttered with many small, unrelated resource groups).
+    """
+    id_set = set(node_ids)
+    incoming: dict[str, list[str]] = {rid: [] for rid in node_ids}
+    for src, tgt, _label in edges:
+        if src in id_set and tgt in id_set:
+            incoming[tgt].append(src)
+
+    depth: dict[str, int] = {}
+
+    def compute_depth(rid, seen):
+        if rid in depth:
+            return depth[rid]
+        if rid in seen:
+            return 0
+        seen = seen | {rid}
+        parents = incoming.get(rid, [])
+        depth[rid] = 0 if not parents else 1 + max(compute_depth(p, seen) for p in parents)
+        return depth[rid]
+
+    for rid in node_ids:
+        compute_depth(rid, frozenset())
+
+    tiers: dict[int, list[str]] = {}
+    for rid in sorted(node_ids):
+        tiers.setdefault(depth[rid], []).append(rid)
+    return [tiers[k] for k in sorted(tiers.keys())]
+
+
+def _card_lines(r: dict, status: str, changed_by: str | None, xlink) -> list[tuple[str, str]]:
+    name = r.get("name", "?")
+    if len(name) > 22:
+        name = name[:20] + "…"
+    lines = [("name", name), ("type", (r.get("type") or "").split("/")[-1])]
+
+    extra = _node_extra_line(r)
+    if extra:
+        lines.append(("extra", extra))
+
+    if status != "unchanged":
+        pill_label = {"added": "NEW", "removed": "REMOVED", "modified": "CHANGED"}[status]
+        lines.append(("pill", pill_label))
+        who = changed_by or "Unknown"
+        if len(who) > 26:
+            who = who[:24] + "…"
+        lines.append(("who", f"by {who}"))
+
+    if xlink:
+        label, target = xlink
+        text = f"{label} {target.get('name','?')}"
+        if len(text) > 24:
+            text = text[:22] + "…"
+        lines.append(("xlink", text))
+
+    return lines
+
+
+_LINE_H = {"name": 15, "type": 13, "extra": 13, "pill": 17, "who": 13, "xlink": 16}
+_ICON_BLOCK_H = 14 + 30 + 8  # top pad + icon size + gap to first text line
+
+
+def _card_height(lines: list[tuple[str, str]]) -> int:
+    return _ICON_BLOCK_H + sum(_LINE_H[k] for k, _ in lines) + 10
+
+
+def _render_card(esc, r: dict, status: str, changed_by, xlink, x: float, y: float) -> list[str]:
+    lines = _card_lines(r, status, changed_by, xlink)
+    h = _card_height(lines)
+    colors = STATUS_COLORS[status]
+    rtype = (r.get("type") or "").lower()
+    style = _get_style(rtype)
+
+    svg = []
+    dash = ' stroke-dasharray="5,3"' if status == "removed" else ""
+    border_w = "2" if status != "unchanged" else "1"
+    svg.append(f'<rect x="{x}" y="{y}" width="{CARD_W}" height="{h}" rx="9" '
+               f'fill="{colors["fill"]}" stroke="{colors["border"]}" stroke-width="{border_w}"{dash}/>')
+
+    cx = x + CARD_W / 2
+    icon_cy = y + 14 + 15
+    icon_uri = _load_icon_data_uri(rtype)
+    if icon_uri:
+        size = 30
+        svg.append(f'<image x="{cx - size/2}" y="{icon_cy - size/2}" width="{size}" height="{size}" href="{icon_uri}"/>')
+    else:
+        svg.append(f'<circle cx="{cx}" cy="{icon_cy}" r="15" fill="{style["color"]}"/>')
+        svg.append(f'<text x="{cx}" y="{icon_cy+4}" font-size="9" font-weight="bold" fill="#ffffff" '
+                   f'text-anchor="middle">{style["glyph"]}</text>')
+
+    cursor_y = y + _ICON_BLOCK_H
+    for kind, text in lines:
+        cursor_y += _LINE_H[kind]
+        if kind == "name":
+            svg.append(f'<text x="{cx}" y="{cursor_y-3}" font-size="11.5" font-weight="600" '
+                       f'text-anchor="middle" fill="{colors["text"]}">{esc(text)}</text>')
+        elif kind in ("type", "extra"):
+            fill = TEXT_FAINT if kind == "type" else TEXT_MUTED
+            svg.append(f'<text x="{cx}" y="{cursor_y-3}" font-size="9" text-anchor="middle" '
+                       f'font-family="{MONO_FONT}" fill="{fill}">{esc(text)}</text>')
+        elif kind == "pill":
+            pill_w = len(text) * 6 + 14
+            py = cursor_y - 12
+            svg.append(f'<rect x="{cx-pill_w/2}" y="{py}" width="{pill_w}" height="14" rx="7" fill="{colors["border"]}"/>')
+            svg.append(f'<text x="{cx}" y="{py+10.5}" font-size="8.5" font-weight="700" text-anchor="middle" '
+                       f'font-family="{MONO_FONT}" fill="#ffffff">{esc(text)}</text>')
+        elif kind == "who":
+            svg.append(f'<text x="{cx}" y="{cursor_y-2}" font-size="8.5" text-anchor="middle" '
+                       f'font-family="{MONO_FONT}" fill="{TEXT_FAINT}">{esc(text)}</text>')
+        elif kind == "xlink":
+            svg.append(f'<line x1="{x+10}" y1="{cursor_y-13}" x2="{x+CARD_W-10}" y2="{cursor_y-13}" '
+                       f'stroke="{GROUP_BORDER}" stroke-dasharray="2,2"/>')
+            svg.append(f'<text x="{cx}" y="{cursor_y-2}" font-size="8.5" text-anchor="middle" '
+                       f'font-family="{MONO_FONT}" fill="{ACCENT}">↗ {esc(text)}</text>')
+    return svg
+
+
+def _build_group_panel(esc, panel_idx: int, rg_name: str, group_nodes: list[dict],
+                        in_edges: list[tuple[str, str, str]], status_of, changed_by_map: dict[str, str],
+                        cross_out: dict[str, tuple]) -> tuple[str, float, float]:
+    node_ids = [r["id"] for r in group_nodes]
+    by_id = {r["id"]: r for r in group_nodes}
+    tiers = _layout_group_tiers(node_ids, in_edges)
+
+    positions: dict[str, tuple[float, float, int]] = {}
+    row_widths = []
+    y_cursor = float(PANEL_HEADER_H + PANEL_PAD)
+    row_layout = []
+    for tier_ids in tiers:
+        heights = [_card_height(_card_lines(by_id[rid], status_of(rid), changed_by_map.get(rid), cross_out.get(rid)))
+                   for rid in tier_ids]
+        row_h = max(heights) if heights else 0
+        row_w = len(tier_ids) * CARD_W + (len(tier_ids) - 1) * GAP_X
+        row_widths.append(row_w)
+        row_layout.append((tier_ids, y_cursor, row_h))
+        y_cursor += row_h + TIER_GAP
+
+    content_w = max(row_widths) if row_widths else CARD_W
+    loc = group_nodes[0].get("location", "")
+    # The header (icon + RG name + count badge + location) can need more
+    # width than the card grid itself, especially for single-card panels —
+    # without this the name and location text overlap in the header.
+    header_content_w = (14 + 24 + len(rg_name) * 7.2 + 10 + 18 + 20
+                         + len(loc) * 6.3 + 14)
+    panel_w = max(content_w + 2 * PANEL_PAD, header_content_w)
+    panel_h = y_cursor - TIER_GAP + PANEL_PAD
+    avail_w = panel_w - 2 * PANEL_PAD
+
+    for tier_ids, row_y, row_h in row_layout:
+        row_w = len(tier_ids) * CARD_W + (len(tier_ids) - 1) * GAP_X
+        x = PANEL_PAD + (avail_w - row_w) / 2
+        for rid in tier_ids:
+            positions[rid] = (x, row_y, row_h)
+            x += CARD_W + GAP_X
+
+    svg = [
+        f'<rect x="0" y="0" width="{panel_w}" height="{panel_h}" rx="13" '
+        f'fill="#ffffff" stroke="{GROUP_BORDER}" stroke-width="1"/>',
+        f'<path d="M0,13 A13,13 0 0 1 13,0 L{panel_w-13},0 A13,13 0 0 1 {panel_w},13 '
+        f'L{panel_w},{PANEL_HEADER_H} L0,{PANEL_HEADER_H} Z" fill="{GROUP_HEADER_BG}"/>',
+        f'<line x1="0" y1="{PANEL_HEADER_H}" x2="{panel_w}" y2="{PANEL_HEADER_H}" stroke="{GROUP_BORDER}"/>',
+    ]
+    rg_icon = _load_icon_data_uri("microsoft.resources/subscriptions/resourcegroups")
+    header_x = 14
+    if rg_icon:
+        svg.append(f'<image x="{header_x}" y="{PANEL_HEADER_H/2-9}" width="18" height="18" href="{rg_icon}"/>')
+        header_x += 24
+    svg.append(f'<text x="{header_x}" y="{PANEL_HEADER_H/2+4}" font-size="12" font-weight="600" '
+               f'font-family="{MONO_FONT}" fill="#16232a">{esc(rg_name)}</text>')
+    count_badge_x = header_x + len(rg_name) * 7.2 + 10
+    svg.append(f'<rect x="{count_badge_x}" y="{PANEL_HEADER_H/2-8}" width="18" height="16" rx="8" fill="{ACCENT_SOFT}"/>')
+    svg.append(f'<text x="{count_badge_x+9}" y="{PANEL_HEADER_H/2+4}" font-size="9.5" font-weight="600" '
+               f'font-family="{MONO_FONT}" text-anchor="middle" fill="{ACCENT}">{len(group_nodes)}</text>')
+    svg.append(f'<text x="{panel_w-14}" y="{PANEL_HEADER_H/2+4}" font-size="9.5" text-anchor="end" '
+               f'font-family="{MONO_FONT}" fill="{TEXT_FAINT}">{esc(loc)}</text>')
+
+    marker_id = f"arrow-{panel_idx}"
+    if in_edges:
+        svg.append(f'<defs><marker id="{marker_id}" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="6" '
+                   f'markerHeight="6" orient="auto-start-reverse">'
+                   f'<path d="M2 1L8 5L2 9" fill="none" stroke="{EDGE_COLOR}" stroke-width="1.5"/></marker></defs>')
+    for src, tgt, label in in_edges:
+        if src not in positions or tgt not in positions:
+            continue
+        sx, sy, sh = positions[src]
+        tx, ty, _th = positions[tgt]
+        x1, y1 = sx + CARD_W / 2, sy + sh
+        x2, y2 = tx + CARD_W / 2, ty
+        svg.append(f'<line x1="{x1}" y1="{y1}" x2="{x2}" y2="{y2}" stroke="{EDGE_COLOR}" '
+                   f'stroke-width="1.3" marker-end="url(#{marker_id})"/>')
+        mx, my = (x1 + x2) / 2, (y1 + y2) / 2
+        lbl_w = len(label) * 5.4 + 8
+        svg.append(f'<rect x="{mx-lbl_w/2}" y="{my-7}" width="{lbl_w}" height="13" rx="3" fill="#ffffff"/>')
+        svg.append(f'<text x="{mx}" y="{my+3}" font-size="9" text-anchor="middle" '
+                   f'font-family="{MONO_FONT}" fill="{TEXT_MUTED}">{esc(label)}</text>')
+
+    for rid, (x, y, _h) in positions.items():
+        svg.extend(_render_card(esc, by_id[rid], status_of(rid), changed_by_map.get(rid), cross_out.get(rid), x, y))
+
+    return "\n".join(svg), panel_w, panel_h
+
+
+def _build_resource_table(esc, all_nodes: list[dict], status_of, changed_by_map: dict[str, str], width: float) -> tuple[str, float]:
+    rows = sorted(all_nodes, key=lambda r: (r.get("resourceGroup", ""), r.get("name", "")))
+    width = max(width, 760)
+    col = {"rg": 0, "type": width * 0.28, "name": width * 0.52, "status": width * 0.78, "who": width * 0.87}
+
+    svg = [f'<text x="0" y="16" font-size="15" font-weight="700" fill="#16232a">'
+           f'All Resources in Subscription ({len(rows)})</text>']
+    y = 40.0
+    headers = [("Resource Group", "rg"), ("Type", "type"), ("Name", "name"), ("Status", "status"), ("Changed By", "who")]
+    for text, key in headers:
+        svg.append(f'<text x="{col[key]}" y="{y}" font-size="10.5" font-weight="700" '
+                   f'fill="{TEXT_MUTED}">{esc(text)}</text>')
+    y += 6
+    svg.append(f'<line x1="0" y1="{y}" x2="{width}" y2="{y}" stroke="{GROUP_BORDER}"/>')
+    y += TABLE_ROW_H
+
+    for i, r in enumerate(rows):
+        if i % 2 == 1:
+            svg.append(f'<rect x="0" y="{y-15}" width="{width}" height="{TABLE_ROW_H}" fill="#f6f8f9"/>')
+        status = status_of(r["id"])
+        colors = STATUS_COLORS[status]
+        svg.append(f'<text x="{col["rg"]}" y="{y}" font-size="10" font-family="{MONO_FONT}" '
+                   f'fill="{TEXT_MUTED}">{esc(r.get("resourceGroup",""))}</text>')
+        svg.append(f'<text x="{col["type"]}" y="{y}" font-size="10" font-family="{MONO_FONT}" '
+                   f'fill="{TEXT_FAINT}">{esc((r.get("type") or "").split("/")[-1])}</text>')
+        svg.append(f'<text x="{col["name"]}" y="{y}" font-size="10.5" fill="#16232a">{esc(r.get("name",""))}</text>')
+        if status != "unchanged":
+            svg.append(f'<text x="{col["status"]}" y="{y}" font-size="9.5" font-weight="700" '
+                       f'font-family="{MONO_FONT}" fill="{colors["text"]}">{status.upper()}</text>')
+            who = changed_by_map.get(r["id"], "Unknown")
+            svg.append(f'<text x="{col["who"]}" y="{y}" font-size="9.5" font-family="{MONO_FONT}" '
+                       f'fill="{TEXT_FAINT}">{esc(who)}</text>')
+        y += TABLE_ROW_H
+
+    return "\n".join(svg), y
+
+
 def generate_diagram_svg(diff: dict, today_resources: list[dict], date_str: str) -> str:
     """
-    Dependency-graph style SVG diagram matching Azure's Resource Visualizer:
-    each resource is an icon card, connected to related resources by arrows
-    (VM -> NIC/Disk, NIC -> VNet/PublicIP/NSG). Cards are color-coded by
-    change status (green border=added, red=removed, amber=modified).
-    Below the graph, an Added/Removed table lists changes in text form.
+    Resource-group-grouped topology diagram: each resource group renders as
+    its own bordered panel with a small dependency graph inside (icon cards
+    + labeled arrows for real Azure relationships), packed left-to-right
+    into rows. This replaced the old single-graph layout, which tiered every
+    resource in the subscription together regardless of resource group and
+    looked cluttered as a result. Relationships that cross resource groups
+    are shown as a note on the source card instead of a line between panels.
+    Below the board, a single flat table lists every resource in the
+    subscription, one row each, with its change status and who made the
+    change (from the Activity Log, via annotate_with_actors).
     """
 
     def esc(s):
         return (s or "").replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
 
-    modified_ids = {m["id"] for m in diff["modified"]}
     added_ids = {r["id"] for r in diff["added"]}
-    removed = diff["removed"]
+    removed_ids = {r["id"] for r in diff["removed"]}
+    modified_ids = {m["id"] for m in diff["modified"]}
+    changed_by_map: dict[str, str] = {}
+    for bucket in ("added", "removed", "modified"):
+        for r in diff[bucket]:
+            changed_by_map[r["id"]] = r.get("changed_by", "Unknown")
 
     def status_of(rid):
+        if rid in removed_ids:
+            return "removed"
         if rid in added_ids:
             return "added"
         if rid in modified_ids:
@@ -560,172 +891,78 @@ def generate_diagram_svg(diff: dict, today_resources: list[dict], date_str: str)
         return "unchanged"
 
     nodes = {r["id"]: r for r in today_resources}
-    for r in removed:
-        nodes.setdefault(r["id"], r)  # ensure removed resources still render as nodes
+    for r in diff["removed"]:
+        nodes.setdefault(r["id"], r)
 
     edges = _extract_edges(today_resources)
 
-    # ---- Tiered layout: isolated nodes on top row, then chains by depth ----
-    incoming = {rid: set() for rid in nodes}
-    outgoing = {rid: set() for rid in nodes}
-    for src, tgt in edges:
-        if src in nodes and tgt in nodes:
-            outgoing[src].add(tgt)
-            incoming[tgt].add(src)
+    groups: dict[str, list[dict]] = {}
+    for r in nodes.values():
+        groups.setdefault(r.get("resourceGroup", "?"), []).append(r)
 
-    depth = {}
-
-    def compute_depth(rid, seen=None):
-        if rid in depth:
-            return depth[rid]
-        seen = seen or set()
-        if rid in seen:
-            return 0
-        seen.add(rid)
-        parents = incoming.get(rid, set())
-        if not parents:
-            depth[rid] = 0
+    in_group_edges: dict[str, list[tuple[str, str, str]]] = {}
+    cross_out: dict[str, tuple] = {}
+    for src, tgt, label in edges:
+        if src not in nodes or tgt not in nodes:
+            continue
+        if nodes[src].get("resourceGroup") == nodes[tgt].get("resourceGroup"):
+            in_group_edges.setdefault(nodes[src]["resourceGroup"], []).append((src, tgt, label))
         else:
-            depth[rid] = 1 + max(compute_depth(p, seen) for p in parents)
-        return depth[rid]
+            cross_out.setdefault(src, (label, nodes[tgt]))
 
-    for rid in nodes:
-        compute_depth(rid)
+    group_order = sorted(groups.keys(), key=lambda rg: -len(groups[rg]))
+    panels = []
+    for idx, rg in enumerate(group_order):
+        svg_str, w, h = _build_group_panel(
+            esc, idx, rg, sorted(groups[rg], key=lambda r: r.get("name", "")),
+            in_group_edges.get(rg, []), status_of, changed_by_map, cross_out,
+        )
+        panels.append({"svg": svg_str, "w": w, "h": h})
 
-    tiers: dict[int, list[str]] = {}
-    for rid, d in depth.items():
-        tiers.setdefault(d, []).append(rid)
-    for rid in removed:
-        tiers.setdefault(0, [])
-        if rid["id"] not in depth:
-            tiers[0].append(rid["id"])
+    shelves: list[list[dict]] = []
+    cur_shelf: list[dict] = []
+    cur_w = 0.0
+    for p in panels:
+        added_w = p["w"] + (PANEL_GAP if cur_shelf else 0)
+        if cur_shelf and cur_w + added_w > BOARD_MAX_W:
+            shelves.append(cur_shelf)
+            cur_shelf, cur_w = [], 0.0
+            added_w = p["w"]
+        cur_shelf.append(p)
+        cur_w += added_w
+    if cur_shelf:
+        shelves.append(cur_shelf)
 
-    CARD_W, CARD_H = 150, 90
-    GAP_X, GAP_Y = 40, 70
-    PAD = 30
+    board_width = 700.0
+    for shelf in shelves:
+        board_width = max(board_width, sum(p["w"] for p in shelf) + PANEL_GAP * (len(shelf) - 1))
 
-    positions = {}
-    max_row_width = 0
-    y = PAD + 10
-    for tier_idx in sorted(tiers.keys()):
-        row = sorted(tiers[tier_idx])
-        row_width = len(row) * CARD_W + (len(row) - 1) * GAP_X
-        max_row_width = max(max_row_width, row_width)
-        x = PAD
-        for rid in row:
-            positions[rid] = (x, y)
-            x += CARD_W + GAP_X
-        y += CARD_H + GAP_Y
+    placed = []
+    y_cursor = 0.0
+    for shelf in shelves:
+        shelf_h = max(p["h"] for p in shelf)
+        x_cursor = 0.0
+        for p in shelf:
+            placed.append((p, x_cursor, y_cursor))
+            x_cursor += p["w"] + PANEL_GAP
+        y_cursor += shelf_h + PANEL_GAP
+    board_height = y_cursor - PANEL_GAP if placed else 0.0
 
-    graph_width = max_row_width + PAD * 2
-    graph_height = y
+    svg_body = [f'<text x="0" y="16" font-size="11" font-family="{MONO_FONT}" fill="{ACCENT}">'
+                f'AZURE RESOURCE GRAPH · {esc(date_str)}</text>']
+    svg_body += [f'<g transform="translate({bx},{by+TITLE_H})">{p["svg"]}</g>' for p, bx, by in placed]
 
-    svg = [
-        f'<defs><marker id="arrow" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="6" '
-        f'markerHeight="6" orient="auto-start-reverse">'
-        f'<path d="M2 1L8 5L2 9" fill="none" stroke="#57606a" stroke-width="1.5"/></marker></defs>',
-    ]
+    table_y = TITLE_H + board_height + 34
+    table_svg, table_h = _build_resource_table(esc, list(nodes.values()), status_of, changed_by_map, board_width)
+    svg_body.append(f'<g transform="translate(0,{table_y})">{table_svg}</g>')
 
-    # Edges (drawn first, under the nodes)
-    for src, tgt in edges:
-        if src in positions and tgt in positions:
-            sx, sy = positions[src]
-            tx, ty = positions[tgt]
-            x1, y1 = sx + CARD_W / 2, sy + CARD_H
-            x2, y2 = tx + CARD_W / 2, ty
-            svg.append(f'<line x1="{x1}" y1="{y1}" x2="{x2}" y2="{y2}" '
-                       f'stroke="#57606a" stroke-width="1" marker-end="url(#arrow)"/>')
-
-    # Nodes
-    for rid, (x, y0) in positions.items():
-        r = nodes[rid]
-        status = "removed" if rid in {rr["id"] for rr in removed} else status_of(rid)
-        colors = STATUS_COLORS[status]
-        rtype = (r.get("type") or "").lower()
-        style = _get_style(rtype)
-
-        border_w = "2.5" if status != "unchanged" else "1"
-        svg.append(f'<rect x="{x}" y="{y0}" width="{CARD_W}" height="{CARD_H}" rx="8" '
-                   f'fill="{colors["fill"]}" stroke="{colors["border"]}" stroke-width="{border_w}"/>')
-        # Icon: official Azure icon image if the file exists, else a colored glyph circle
-        cx, cy = x + CARD_W / 2, y0 + 26
-        icon_uri = _load_icon_data_uri(rtype)
-        if icon_uri:
-            icon_size = 32
-            svg.append(f'<image x="{cx - icon_size/2}" y="{cy - icon_size/2}" '
-                       f'width="{icon_size}" height="{icon_size}" href="{icon_uri}"/>')
-        else:
-            svg.append(f'<circle cx="{cx}" cy="{cy}" r="18" fill="{style["color"]}"/>')
-            svg.append(f'<text x="{cx}" y="{cy+4}" font-size="10" font-weight="bold" fill="#ffffff" '
-                       f'text-anchor="middle">{style["glyph"]}</text>')
-        # Name + type
-        name = esc(r.get("name", "?"))
-        if len(name) > 20:
-            name = name[:18] + "…"
-        svg.append(f'<text x="{cx}" y="{y0+58}" font-size="11" text-anchor="middle" '
-                   f'fill="{colors["text"]}">{name}</text>')
-        short_type = esc((r.get("type") or "").split("/")[-1])
-        svg.append(f'<text x="{cx}" y="{y0+72}" font-size="9" text-anchor="middle" '
-                   f'fill="#57606a">{short_type}</text>')
-
-    # ---- 3-column table: Current Network Resources | Newly Added | Newly Deleted ----
-    added = diff["added"]
-
-    def is_network(r):
-        return (r.get("type") or "").lower().startswith("microsoft.network/")
-
-    current_network = sorted(
-        [r for r in today_resources if is_network(r)],
-        key=lambda r: r.get("name", "")
-    )
-
-    table_y = graph_height + 30
-    row_h = 30
-    col_w = graph_width / 3
-
-    svg.append(f'<text x="{PAD}" y="{table_y}" font-size="14" font-weight="bold" '
-               f'fill="#1f2328">Network Resource Changes — {esc(date_str)}</text>')
-    table_y += 22
-
-    col_headers = [
-        (f"Current Network Resources ({len(current_network)})", "#1f2328"),
-        (f"Newly Added ({len(added)})", "#1a7f37"),
-        (f"Newly Deleted ({len(removed)})", "#cf222e"),
-    ]
-    for i, (label, color) in enumerate(col_headers):
-        svg.append(f'<text x="{PAD + i*col_w}" y="{table_y}" font-size="12" '
-                   f'font-weight="bold" fill="{color}">{esc(label)}</text>')
-    table_y += 8
-    svg.append(f'<line x1="{PAD}" y1="{table_y}" x2="{PAD+graph_width}" y2="{table_y}" '
-               f'stroke="#d0d7de" stroke-width="1"/>')
-    table_y += 16
-
-    columns_data = [current_network, added, removed]
-    max_rows = max(len(c) for c in columns_data) if any(columns_data) else 1
-
-    for i in range(max_rows):
-        ry = table_y + i * row_h
-        for col_idx, col_items in enumerate(columns_data):
-            if i < len(col_items):
-                item = col_items[i]
-                x = PAD + col_idx * col_w
-                type_short = esc((item.get("type") or "").split("/")[-1])
-                svg.append(f'<text x="{x}" y="{ry}" font-size="10.5" fill="#1f2328">'
-                           f'{esc(item.get("name",""))} '
-                           f'<tspan fill="#57606a">({type_short})</tspan></text>')
-                # "Changed by" only applies to Added/Removed columns (index 1, 2) —
-                # the Current Network Resources column (index 0) has no actor data.
-                if col_idx in (1, 2):
-                    who = esc(item.get("changed_by", "Unknown"))
-                    svg.append(f'<text x="{x}" y="{ry+13}" font-size="9" fill="#8c959f">by {who}</text>')
-
-    total_height = table_y + max_rows * row_h + 20
-    total_width = max(graph_width, 700)
+    total_width = max(board_width, 760)
+    total_height = table_y + table_h + 20
 
     header = (f'<svg viewBox="0 0 {total_width} {total_height}" xmlns="http://www.w3.org/2000/svg" '
               f'font-family="Segoe UI, Arial, sans-serif">'
               f'<rect width="{total_width}" height="{total_height}" fill="#ffffff"/>')
-    return header + "\n".join(svg) + "</svg>"
+    return header + "\n".join(svg_body) + "</svg>"
 
 
 def save_diagram(container, date_str: str, svg_content: str) -> str:
